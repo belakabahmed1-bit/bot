@@ -295,6 +295,62 @@ class PlatformHandler(SimpleHTTPRequestHandler):
             return self._send_json({"active": 0})
 
 # ---------------- 1. API: قائمة الوحدات من Turso ----------------
+                # ---------------- 💬 API: جلب رسائل المحادثة مع الأستاذ ----------------
+        elif path == "/api/chat/messages":
+            phone = params.get("phone", [None])[0]
+            if not phone:
+                return self._send_json([])
+            phone = normalize_phone(phone)
+            try:
+                import db
+                student_id = None
+                if turso_client:
+                    student_rows = turso_client.execute("SELECT id FROM web_users WHERE phone = ?", [phone])
+                    if student_rows:
+                        student_id = student_rows[0][0]
+
+                if not student_id:
+                    with db.db_lock:
+                        db.cursor.execute("SELECT user_id FROM users WHERE phone = ?", (phone,))
+                        u_row = db.cursor.fetchone()
+                        if u_row:
+                            student_id = u_row[0]
+                        else:
+                            db.cursor.execute("SELECT user_id FROM wait WHERE phone = ?", (phone,))
+                            w_row = db.cursor.fetchone()
+                            if w_row:
+                                student_id = w_row[0]
+
+                if not student_id:
+                    return self._send_json([])
+
+                with db.db_lock:
+                    db.cursor.execute("""
+                        SELECT id, sender_id, sender_name, message_text, created_at, is_read
+                        FROM chat_messages
+                        WHERE (sender_id = ? AND receiver_id = 5279737033) 
+                           OR (sender_id = 5279737033 AND receiver_id = ?)
+                        ORDER BY id ASC
+                        LIMIT 150
+                    """, (student_id, student_id))
+                    rows = db.cursor.fetchall()
+
+                messages = []
+                for r in rows:
+                    is_student = (r[1] == student_id)
+                    messages.append({
+                        "id": r[0],
+                        "sender": "student" if is_student else "teacher",
+                        "sender_name": r[2] or ("أنت" if is_student else "الأستاذ بلعقاب أسامة"),
+                        "text": r[3],
+                        "time": r[4] or "",
+                        "is_read": r[5]
+                    })
+                return self._send_json(messages)
+            except Exception as e:
+                print("Chat messages fetch error:", e)
+                return self._send_json([])
+
         elif path == "/api/units":
             if turso_client:
                 rows = turso_client.execute("SELECT id, name FROM units WHERE is_active=1 ORDER BY id ASC")
@@ -649,102 +705,205 @@ class PlatformHandler(SimpleHTTPRequestHandler):
             if not phone or not secret_input:
                 return self._send_json({"success": False, "error": "يرجى إدخال رقم الهاتف والرمز السري."})
 
-            if turso_client:
-                rows = turso_client.execute("""
-                    SELECT id, first_name, last_name, phone, branch, school, pw_hash, code, active
-                    FROM web_users WHERE phone = ?
-                """, [phone])
+            if not turso_client:
+                return self._send_json({"success": False, "error": "تعذر الاتصال بقاعدة البيانات."})
 
-                if not rows:
-                    # فحص إذا كان مسجلاً في بوت التلغرام المحلي
-                    try:
-                        import db
-                        with db.db_lock:
-                            # فحص المحذوفين
-                            db.cursor.execute("SELECT user_id, full_name, phone FROM deleted_users WHERE phone = ?", (phone,))
-                            if db.cursor.fetchone():
-                                return self._send_json({
-                                    "success": False,
-                                    "is_active": -1,
-                                    "error": "🚫 غير مفعل! الموقع خاص بتلاميذ الأستاذ بلعقاب أسامة فقط. أرسل رسالة للأستاذ لتفعيل الحساب."
-                                })
+            # 1. التحقق من قائمة المحظورين أولاً
+            try:
+                import db
+                with db.db_lock:
+                    db.cursor.execute("SELECT user_id, full_name, phone FROM deleted_users WHERE phone = ?", (phone,))
+                    if db.cursor.fetchone():
+                        return self._send_json({
+                            "success": False,
+                            "is_active": -1,
+                            "is_banned": True,
+                            "error": "🚫 هذا الحساب موقوف من قبل الأستاذ بلعقاب أسامة."
+                        })
+            except Exception as e_del:
+                print("Check deleted error:", e_del)
 
-                            # فحص الانتظار
-                            db.cursor.execute("SELECT user_id, full_name, school, code, phone FROM wait WHERE phone = ?", (phone,))
-                            if db.cursor.fetchone():
-                                return self._send_json({
-                                    "success": False,
-                                    "is_active": 0,
-                                    "needs_activation": True,
-                                    "error": "🚫 غير مفعل! الموقع خاص بتلاميذ الأستاذ بلعقاب أسامة فقط. أرسل رسالة للأستاذ لتفعيل الحساب."
-                                })
+            # دالة التحقق من صحة الكود السري
+            def _code_matches(input_val, stored_code, stored_hash=""):
+                if not input_val:
+                    return False
+                inp_u = input_val.strip().upper()
+                c_u = str(stored_code or "").strip().upper()
+                if c_u and inp_u == c_u:
+                    return True
+                import hashlib
+                h_salted = hash_password(input_val.strip())
+                h_salted_u = hash_password(inp_u)
+                h_unsalted = hashlib.sha256(input_val.strip().encode("utf-8")).hexdigest()
+                h_unsalted_u = hashlib.sha256(inp_u.encode("utf-8")).hexdigest()
+                target_h = str(stored_hash or "").strip()
+                if target_h and target_h in (h_salted, h_salted_u, h_unsalted, h_unsalted_u, input_val.strip(), inp_u):
+                    return True
+                return False
 
-                            # فحص المفعلين في البوت
-                            db.cursor.execute("SELECT user_id, full_name, school, phone, code FROM users WHERE phone = ?", (phone,))
-                            u_bot = db.cursor.fetchone()
-                            if u_bot:
-                                code_bot = str(u_bot[4] or "").strip().upper()
-                                if secret_input.upper() == code_bot or not code_bot:
-                                    parts = (u_bot[1] or "").split(maxsplit=1)
-                                    fn = parts[0] if parts else ""
-                                    ln = parts[1] if len(parts) > 1 else ""
-                                    c_val = code_bot or generate_activation_code()
-                                    pw_h = hash_password(c_val)
-                                    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-                                    turso_client.execute("""
-                                        INSERT OR REPLACE INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
-                                        VALUES (?, ?, ?, 'شعبة عامة', ?, ?, ?, 1, ?)
-                                    """, [fn, ln, phone, u_bot[2] or "دراسة عن بعد 🌐", pw_h, c_val, now])
-                                    rows = turso_client.execute("SELECT id, first_name, last_name, phone, branch, school, pw_hash, code, active FROM web_users WHERE phone = ?", [phone])
-                    except Exception as e_sync:
-                        print("Sync bot user to web error:", e_sync)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-                if not rows:
-                    return self._send_json({"success": False, "error": "رقم الهاتف غير مسجل! يرجى إنشاء حساب جديد أولاً عبر الموقع أو البوت."})
+            # 2. فحص جدول web_users
+            web_rows = turso_client.execute("""
+                SELECT id, first_name, last_name, phone, branch, school, pw_hash, code, active
+                FROM web_users WHERE phone = ?
+            """, [phone])
 
-                u = rows[0]
-                code_db = str(u[7] or "").strip().upper()
-                pw_hash_db = str(u[6] or "").strip()
-                input_upper = secret_input.upper()
-                input_hash = hash_password(secret_input)
+            if web_rows:
+                u = web_rows[0]
+                u_id, fn, ln, ph, br, sch, pw_h, cd, act = u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8]
+                act = int(act if act is not None else 0)
 
-                # Accept: plain code match, salted hash, unsalted hash, uppercase salted hash
-                import hashlib as _hl
-                unsalted_hash = _hl.sha256(secret_input.encode()).hexdigest()
-                unsalted_hash_upper = _hl.sha256(input_upper.encode()).hexdigest()
-                is_valid = (input_upper == code_db) or (input_hash == pw_hash_db) or (unsalted_hash == pw_hash_db) or (unsalted_hash_upper == pw_hash_db) or (hash_password(input_upper) == pw_hash_db)
-
-                if not is_valid:
-                    return self._send_json({"success": False, "error": "الرمز السري غير صحيح. يرجى التأكد من الرمز الممنوح لك في بوت التليجرام."})
-
-                is_active = int(u[8] if u[8] is not None else 0)
-                full_name = f"{u[1]} {u[2]}".strip()
-                user_obj = {
-                    "id": u[0],
-                    "full_name": full_name,
-                    "phone": u[3],
-                    "branch": u[4],
-                    "school": u[5],
-                    "activation_code": u[7],
-                    "code": u[7],
-                    "is_active": is_active
-                }
-
-                # فحص الطرد أو عدم التفعيل
-                if is_active <= 0:
+                if act == -1:
                     return self._send_json({
                         "success": False,
-                        "is_active": is_active,
-                        "needs_activation": True,
-                        "is_banned": (is_active == -1),
-                        "error": "🚫 غير مفعل! الموقع خاص بتلاميذ الأستاذ بلعقاب أسامة فقط. أرسل رسالة للأستاذ لتفعيل الحساب."
+                        "is_active": -1,
+                        "is_banned": True,
+                        "error": "🚫 هذا الحساب موقوف من قبل الأستاذ بلعقاب أسامة."
                     })
 
-                import urllib.parse
-                cookie_str = f"math_student_session={urllib.parse.quote(json.dumps(user_obj))}; Path=/; Max-Age=31536000; SameSite=Lax"
-                return self._send_json({"success": True, "is_active": 1, "message": "✅ الحساب مفعّل! مرحباً بك.", "user": user_obj}, cookie=cookie_str)
+                # فحص تطابق الكود
+                if _code_matches(secret_input, cd, pw_h):
+                    # تفعيل الحساب فوراً لأن الكود السري صحيح ومطابق
+                    if act == 0:
+                        turso_client.execute("UPDATE web_users SET active = 1 WHERE id = ?", [u_id])
+                        act = 1
+                        try:
+                            import db
+                            with db.db_lock:
+                                db.cursor.execute("SELECT user_id, full_name, school, code, created_at, phone FROM wait WHERE phone = ?", (phone,))
+                                w_row = db.cursor.fetchone()
+                                if w_row:
+                                    db.cursor.execute("INSERT OR REPLACE INTO users (user_id, full_name, school, last_active, joined_at, phone, code, source) VALUES (?,?,?,?,?,?,?,?)",
+                                                      (w_row[0], w_row[1], w_row[2], now, w_row[4] or now, phone, cd or w_row[3], "bot"))
+                                    db.cursor.execute("DELETE FROM wait WHERE phone = ?", (phone,))
+                                    db.conn.commit()
+                        except Exception as e_w:
+                            print("Sync activate wait error:", e_w)
 
-            return self._send_json({"success": False, "error": "تعذر الاتصال بقاعدة البيانات."})
+                    full_name = f"{fn} {ln}".strip()
+                    user_obj = {
+                        "id": u_id,
+                        "full_name": full_name,
+                        "phone": ph,
+                        "branch": br or "شعبة عامة",
+                        "school": sch or "دراسة عن بعد 🌐",
+                        "activation_code": cd,
+                        "code": cd,
+                        "is_active": 1
+                    }
+                    import urllib.parse
+                    cookie_str = f"math_student_session={urllib.parse.quote(json.dumps(user_obj))}; Path=/; Max-Age=31536000; SameSite=Lax"
+                    return self._send_json({
+                        "success": True,
+                        "is_active": 1,
+                        "message": "✅ تم تسجيل الدخول وتفعيل الحساب بنجاح! مرحباً بك.",
+                        "user": user_obj
+                    }, cookie=cookie_str)
+                else:
+                    return self._send_json({
+                        "success": False,
+                        "error": "الرمز السري غير صحيح. يرجى التأكد من الرمز الممنوح لك في بوت التليجرام."
+                    })
+
+            # 3. فحص المفعلين أو المنتظرين في بوت التلغرام المحلي
+            try:
+                import db
+                with db.db_lock:
+                    # فحص المفعلين في البوت users
+                    db.cursor.execute("SELECT user_id, full_name, school, phone, code, source FROM users WHERE phone = ?", (phone,))
+                    u_bot = db.cursor.fetchone()
+                    if u_bot:
+                        uid_bot, fn_bot, sch_bot, ph_bot, cd_bot, src_bot = u_bot[0], u_bot[1], u_bot[2], u_bot[3], u_bot[4], u_bot[5]
+                        if _code_matches(secret_input, cd_bot):
+                            parts = (fn_bot or "").split(maxsplit=1)
+                            fn_val = parts[0] if parts else ""
+                            ln_val = parts[1] if len(parts) > 1 else ""
+                            c_val = cd_bot or generate_activation_code()
+                            pw_val = hash_password(c_val)
+                            turso_client.execute("""
+                                INSERT OR REPLACE INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
+                                VALUES (?, ?, ?, 'شعبة عامة', ?, ?, ?, 1, ?)
+                            """, [fn_val, ln_val, phone, sch_bot or "دراسة عن بعد 🌐", pw_val, c_val, now])
+                            
+                            w_res = turso_client.execute("SELECT id FROM web_users WHERE phone = ?", [phone])
+                            new_id = w_res[0][0] if w_res else uid_bot
+
+                            user_obj = {
+                                "id": new_id,
+                                "full_name": fn_bot,
+                                "phone": phone,
+                                "branch": "شعبة عامة",
+                                "school": sch_bot or "دراسة عن بعد 🌐",
+                                "activation_code": c_val,
+                                "code": c_val,
+                                "is_active": 1
+                            }
+                            import urllib.parse
+                            cookie_str = f"math_student_session={urllib.parse.quote(json.dumps(user_obj))}; Path=/; Max-Age=31536000; SameSite=Lax"
+                            return self._send_json({
+                                "success": True,
+                                "is_active": 1,
+                                "message": "✅ تم تسجيل الدخول بنجاح عبر حسابك في التليجرام!",
+                                "user": user_obj
+                            }, cookie=cookie_str)
+                        else:
+                            return self._send_json({
+                                "success": False,
+                                "error": "الرمز السري غير صحيح. يرجى التأكد من الرمز الممنوح لك في بوت التليجرام."
+                            })
+
+                    # فحص قائمة انتظار البوت wait
+                    db.cursor.execute("SELECT user_id, full_name, school, code, created_at, phone, source FROM wait WHERE phone = ?", (phone,))
+                    w_bot = db.cursor.fetchone()
+                    if w_bot:
+                        uid_w, fn_w, sch_w, cd_w, cr_w, ph_w, src_w = w_bot[0], w_bot[1], w_bot[2], w_bot[3], w_bot[4], w_bot[5], w_bot[6]
+                        if _code_matches(secret_input, cd_w):
+                            db.cursor.execute("INSERT OR REPLACE INTO users (user_id, full_name, school, last_active, joined_at, phone, code, source) VALUES (?,?,?,?,?,?,?,?)",
+                                              (uid_w, fn_w, sch_w, now, cr_w or now, phone, cd_w, src_w or "bot"))
+                            db.cursor.execute("DELETE FROM wait WHERE phone = ?", (phone,))
+                            db.conn.commit()
+
+                            parts = (fn_w or "").split(maxsplit=1)
+                            fn_val = parts[0] if parts else ""
+                            ln_val = parts[1] if len(parts) > 1 else ""
+                            pw_val = hash_password(cd_w)
+                            turso_client.execute("""
+                                INSERT OR REPLACE INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
+                                VALUES (?, ?, ?, 'شعبة عامة', ?, ?, ?, 1, ?)
+                            """, [fn_val, ln_val, phone, sch_w or "دراسة عن بعد 🌐", pw_val, cd_w, now])
+
+                            w_res = turso_client.execute("SELECT id FROM web_users WHERE phone = ?", [phone])
+                            new_id = w_res[0][0] if w_res else uid_w
+
+                            user_obj = {
+                                "id": new_id,
+                                "full_name": fn_w,
+                                "phone": phone,
+                                "branch": "شعبة عامة",
+                                "school": sch_w or "دراسة عن بعد 🌐",
+                                "activation_code": cd_w,
+                                "code": cd_w,
+                                "is_active": 1
+                            }
+                            import urllib.parse
+                            cookie_str = f"math_student_session={urllib.parse.quote(json.dumps(user_obj))}; Path=/; Max-Age=31536000; SameSite=Lax"
+                            return self._send_json({
+                                "success": True,
+                                "is_active": 1,
+                                "message": "✅ تم تفعيل حسابك وتسجيل الدخول بنجاح! مرحباً بك.",
+                                "user": user_obj
+                            }, cookie=cookie_str)
+                        else:
+                            return self._send_json({
+                                "success": False,
+                                "error": "الرمز السري غير صحيح. يرجى التأكد من الرمز الممنوح لك في بوت التليجرام."
+                            })
+
+            except Exception as e_bot_login:
+                print("Bot login fallback error:", e_bot_login)
+
+            return self._send_json({"success": False, "error": "رقم الهاتف غير مسجل! يرجى إنشاء حساب جديد أولاً عبر الموقع أو البوت."})
 
         # ---------------- 🔑 3. تفعيل الحساب بكود الأستاذ في Turso ----------------
         elif path == "/api/auth/activate":

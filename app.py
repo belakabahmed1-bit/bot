@@ -269,6 +269,20 @@ def process_registration(message):
             (uid, full_name, text, code, now_time, phone)
         )
         conn.commit()
+        # مزامنة طلب الانتظار إلى web_users أيضاً لتمكين الدخول فوراً عبر الموقع
+        try:
+            from web_server import turso_client, hash_password
+            if turso_client and phone:
+                parts = (full_name or "").split(maxsplit=1)
+                fn_val = parts[0] if parts else ""
+                ln_val = parts[1] if len(parts) > 1 else ""
+                pw_val = hash_password(code)
+                turso_client.execute("""
+                    INSERT OR REPLACE INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
+                    VALUES (?, ?, ?, 'شعبة عامة', ?, ?, ?, 0, ?)
+                """, [fn_val, ln_val, phone, text or "دراسة عن بعد 🌐", pw_val, code, now_time])
+        except Exception as e_w_sync:
+            print("Sync bot wait to web_users error:", e_w_sync)
 
         # إشعار الأستاذ فوراً بطلب تسجيل جديد من بوت التلغرام
         try:

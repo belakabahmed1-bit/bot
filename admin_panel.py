@@ -49,10 +49,27 @@ admin_video_state = {}
 
 
 # ===================== دوال الاستعلام والبيانات =====================
+def get_bot_phones():
+    """جلب أرقام هواتف المسجلين عبر بوت التلغرام لتمييز المصدر بدقة."""
+    b_phones = set()
+    with db_lock:
+        try:
+            cursor.execute("SELECT phone FROM users WHERE (source = 'bot' OR source IS NULL) AND phone IS NOT NULL AND phone != ''")
+            for r in cursor.fetchall():
+                b_phones.add(str(r[0]).strip())
+            cursor.execute("SELECT phone FROM wait WHERE (source = 'bot' OR source IS NULL) AND phone IS NOT NULL AND phone != ''")
+            for r in cursor.fetchall():
+                b_phones.add(str(r[0]).strip())
+        except Exception:
+            pass
+    return b_phones
+
+
 def get_users_list():
-    """جلب قائمة جميع التلاميذ المفعلين سواء من بوت التلغرام أو من الموقع الإلكتروني."""
+    """جلب قائمة جميع التلاميذ المفعلين مع تمييز دقيق لمصدر التسجيل (بوت أو موقع)."""
     merged = []
     seen_phones = set()
+    bot_phones = get_bot_phones()
 
     # 1. التلاميذ المفعلين في الموقع الإلكتروني (Turso web_users active = 1)
     try:
@@ -73,7 +90,8 @@ def get_users_list():
                 cd = r[6] or ""
                 dt = r[7] or "—"
                 school_display = f"{sch} ({br})" if br else sch
-                merged.append((f"W-{wid}", full_name, school_display, dt, dt, ph, cd, "web"))
+                src = "bot" if (ph and ph in bot_phones) else "web"
+                merged.append((f"W-{wid}", full_name, school_display, dt, dt, ph, cd, src))
                 if ph:
                     seen_phones.add(ph)
     except Exception as e:
@@ -2065,20 +2083,23 @@ def find_student_code_info(query):
                 FROM web_users
                 WHERE phone LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR code = ?
             """, [f"%{query}%", f"%{query}%", f"%{query}%", query.upper()])
+            bot_phones = get_bot_phones()
             for r in web_rows:
                 act = int(r[7] or 0)
                 status_str = "✅ مفعّل ونشط" if act == 1 else ("🚫 محظور / مطرود" if act == -1 else "⏳ قيد الانتظار")
+                ph_val = r[3] or ""
+                src_type = "bot" if (ph_val and ph_val in bot_phones) else "web"
                 results.append({
                     "id": r[0],
                     "name": f"{r[1]} {r[2]}".strip(),
-                    "phone": r[3],
+                    "phone": ph_val,
                     "school": r[4],
                     "branch": r[5],
                     "code": r[6],
                     "status": status_str,
                     "active": act,
                     "created_at": r[8],
-                    "source_type": "web"
+                    "source_type": src_type
                 })
     except Exception as e:
         print("Search web_users error:", e)
@@ -2181,8 +2202,9 @@ def get_all_students_for_codes():
     all_st = []
     seen = set()
 
-    # 1. تلاميذ الموقع من Turso
+    # 1. تلاميذ الموقع مع تمييز المسجلين أصلاً من البوت
     try:
+        bot_phones = get_bot_phones()
         from web_server import turso_client
         if turso_client:
             web_rows = turso_client.execute("""
@@ -2194,6 +2216,7 @@ def get_all_students_for_codes():
                 ph = r[3] or "غير مسجل"
                 act = int(r[7] or 0)
                 status_icon = "🟢 مفعل" if act == 1 else ("🔴 محظور" if act == -1 else "🟡 انتظار")
+                src = "🤖 البوت" if (ph != "غير مسجل" and ph in bot_phones) else "🌐 الموقع"
                 all_st.append({
                     "id": f"W-{r[0]}",
                     "name": f"{r[1]} {r[2]}".strip(),
@@ -2201,7 +2224,7 @@ def get_all_students_for_codes():
                     "code": r[6] or "—",
                     "school": r[4] or "دراسة عن بعد 🌐",
                     "branch": r[5] or "",
-                    "source": "🌐 الموقع",
+                    "source": src,
                     "status": status_icon
                 })
                 if ph != "غير مسجل":

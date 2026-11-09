@@ -587,7 +587,51 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                 """, [phone])
 
                 if not rows:
-                    return self._send_json({"success": False, "error": "رقم الهاتف غير مسجل! يرجى التسجيل أولاً عبر بوت التليجرام الخاص بالأستاذ أسامة."})
+                    # فحص إذا كان مسجلاً في بوت التلغرام المحلي
+                    try:
+                        import db
+                        with db.db_lock:
+                            # فحص المحذوفين
+                            db.cursor.execute("SELECT user_id, full_name, phone FROM deleted_users WHERE phone = ?", (phone,))
+                            if db.cursor.fetchone():
+                                return self._send_json({
+                                    "success": False,
+                                    "is_active": -1,
+                                    "error": "🚫 غير مفعل! الموقع خاص بتلاميذ الأستاذ بلعقاب أسامة فقط. أرسل رسالة للأستاذ لتفعيل الحساب."
+                                })
+
+                            # فحص الانتظار
+                            db.cursor.execute("SELECT user_id, full_name, school, code, phone FROM wait WHERE phone = ?", (phone,))
+                            if db.cursor.fetchone():
+                                return self._send_json({
+                                    "success": False,
+                                    "is_active": 0,
+                                    "needs_activation": True,
+                                    "error": "🚫 غير مفعل! الموقع خاص بتلاميذ الأستاذ بلعقاب أسامة فقط. أرسل رسالة للأستاذ لتفعيل الحساب."
+                                })
+
+                            # فحص المفعلين في البوت
+                            db.cursor.execute("SELECT user_id, full_name, school, phone, code FROM users WHERE phone = ?", (phone,))
+                            u_bot = db.cursor.fetchone()
+                            if u_bot:
+                                code_bot = str(u_bot[4] or "").strip().upper()
+                                if secret_input.upper() == code_bot or not code_bot:
+                                    parts = (u_bot[1] or "").split(maxsplit=1)
+                                    fn = parts[0] if parts else ""
+                                    ln = parts[1] if len(parts) > 1 else ""
+                                    c_val = code_bot or generate_activation_code()
+                                    pw_h = hash_password(c_val)
+                                    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                                    turso_client.execute("""
+                                        INSERT OR REPLACE INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
+                                        VALUES (?, ?, ?, 'شعبة عامة', ?, ?, ?, 1, ?)
+                                    """, [fn, ln, phone, u_bot[2] or "دراسة عن بعد 🌐", pw_h, c_val, now])
+                                    rows = turso_client.execute("SELECT id, first_name, last_name, phone, branch, school, pw_hash, code, active FROM web_users WHERE phone = ?", [phone])
+                    except Exception as e_sync:
+                        print("Sync bot user to web error:", e_sync)
+
+                if not rows:
+                    return self._send_json({"success": False, "error": "رقم الهاتف غير مسجل! يرجى إنشاء حساب جديد أولاً عبر الموقع أو البوت."})
 
                 u = rows[0]
                 code_db = str(u[7] or "").strip().upper()
@@ -613,26 +657,19 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                     "is_active": is_active
                 }
 
-                # فحص الطرد والحظر (حتى لو يملك الرقم والرمز السري لا يمكنه الدخول)
-                if is_active == -1:
+                # فحص الطرد أو عدم التفعيل
+                if is_active <= 0:
                     return self._send_json({
                         "success": False,
-                        "is_banned": True,
-                        "error": "🚫 تم إيقاف هذا الحساب وطردك من المنصة من طرف الأستاذ بلعقاب أسامة."
-                    })
-
-                # فحص الانتظار وعدم التفعيل بعد
-                if is_active == 0:
-                    return self._send_json({
-                        "success": False,
+                        "is_active": is_active,
                         "needs_activation": True,
-                        "error": "⏳ حسابك قيد الانتظار لموافقة الأستاذ بلعقاب أسامة. يمكنك إدخال كود التفعيل لتفعيله فوراً.",
-                        "user": user_obj
+                        "is_banned": (is_active == -1),
+                        "error": "🚫 غير مفعل! الموقع خاص بتلاميذ الأستاذ بلعقاب أسامة فقط. أرسل رسالة للأستاذ لتفعيل الحساب."
                     })
 
                 import urllib.parse
                 cookie_str = f"math_student_session={urllib.parse.quote(json.dumps(user_obj))}; Path=/; Max-Age=31536000; SameSite=Lax"
-                return self._send_json({"success": True, "message": "تم تسجيل الدخول بنجاح!", "user": user_obj}, cookie=cookie_str)
+                return self._send_json({"success": True, "is_active": 1, "message": "✅ الحساب مفعّل! مرحباً بك.", "user": user_obj}, cookie=cookie_str)
 
             return self._send_json({"success": False, "error": "تعذر الاتصال بقاعدة البيانات."})
 

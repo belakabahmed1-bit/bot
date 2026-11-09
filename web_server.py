@@ -205,9 +205,9 @@ class TursoHTTPClient:
         finally:
             conn.close()
 
-    def _cloud_sync(self, sql, params=None):
+    def _remote_execute(self, sql, params=None):
         if not self.session or not self.endpoint or not self.auth_token:
-            return
+            return None
         try:
             stmt = {"sql": sql}
             if params:
@@ -228,15 +228,33 @@ class TursoHTTPClient:
                 "Authorization": f"Bearer {self.auth_token}",
                 "Content-Type": "application/json"
             }
-            self.session.post(self.endpoint, headers=headers, json=payload, timeout=3.5)
-        except Exception:
-            pass
+            resp = self.session.post(self.endpoint, headers=headers, json=payload, timeout=4.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("results", [])
+                if results and results[0].get("type") == "ok":
+                    exec_res = results[0]["response"]["result"]
+                    rows = []
+                    for r in exec_res.get("rows", []):
+                        rows.append([col.get("value") for col in r])
+                    return rows
+        except Exception as e:
+            print("Remote Turso query error:", e)
+        return None
+
+    def _cloud_sync(self, sql, params=None):
+        self._remote_execute(sql, params)
 
     def execute(self, sql, params=None):
         clean_sql = sql.strip().upper()
+        # للاستعلامات: نفحص Turso السحابي أولاً، وإذا تعذر نقرأ من SQLite المحلي كاحتياط
         if clean_sql.startswith("SELECT"):
+            rem_rows = self._remote_execute(sql, params)
+            if rem_rows is not None:
+                return rem_rows
             return self._local_execute(sql, params)
 
+        # للكتابة والتعديل: نكتب محلياً وسحابياً في نفس الوقت
         res = self._local_execute(sql, params)
         if self.session and self.endpoint and self.auth_token:
             import threading
@@ -804,13 +822,16 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                     # الرمز لم يتطابق مع جدول web_users القديم، نفحص جدول البوت users أو wait فقد يكون التلميذ أنشأ رمزاً جديداً في البوت
                     pass
 
-            # 3. فحص المفعلين أو المنتظرين في بوت التلغرام المحلي
+            # 3. فحص المفعلين أو المنتظرين في بوت التلغرام (سواء في Turso السحابي أو المحلي)
             try:
                 import db
-                with db.db_lock:
-                    # فحص المفعلين في البوت users
-                    db.cursor.execute("SELECT user_id, full_name, school, phone, code, source FROM users WHERE phone = ?", (phone,))
-                    u_bot = db.cursor.fetchone()
+                # فحص جدول users في Turso السحابي أولاً
+                u_bot_rows = turso_client.execute("SELECT user_id, full_name, school, phone, code, source FROM users WHERE phone = ?", [phone]) if turso_client else []
+                u_bot = u_bot_rows[0] if u_bot_rows else None
+                if not u_bot:
+                    with db.db_lock:
+                        db.cursor.execute("SELECT user_id, full_name, school, phone, code, source FROM users WHERE phone = ?", (phone,))
+                        u_bot = db.cursor.fetchone()
                     if u_bot:
                         uid_bot, fn_bot, sch_bot, ph_bot, cd_bot, src_bot = u_bot[0], u_bot[1], u_bot[2], u_bot[3], u_bot[4], u_bot[5]
                         if _code_matches(secret_input, cd_bot):
@@ -856,9 +877,12 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                                 "error": "الرمز السري غير صحيح. يرجى التأكد من الرمز الممنوح لك في بوت التليجرام."
                             })
 
-                    # فحص قائمة انتظار البوت wait
-                    db.cursor.execute("SELECT user_id, full_name, school, code, created_at, phone, source FROM wait WHERE phone = ?", (phone,))
-                    w_bot = db.cursor.fetchone()
+                    # فحص قائمة انتظار البوت wait في Turso السحابي والمحلي
+                    w_bot_rows = turso_client.execute("SELECT user_id, full_name, school, code, created_at, phone, source FROM wait WHERE phone = ?", [phone]) if turso_client else []
+                    w_bot = w_bot_rows[0] if w_bot_rows else None
+                    if not w_bot:
+                        db.cursor.execute("SELECT user_id, full_name, school, code, created_at, phone, source FROM wait WHERE phone = ?", (phone,))
+                        w_bot = db.cursor.fetchone()
                     if w_bot:
                         uid_w, fn_w, sch_w, cd_w, cr_w, ph_w, src_w = w_bot[0], w_bot[1], w_bot[2], w_bot[3], w_bot[4], w_bot[5], w_bot[6]
                         if _code_matches(secret_input, cd_w):

@@ -18,7 +18,7 @@ import hashlib
 import secrets
 import string
 import mimetypes
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 
@@ -198,6 +198,10 @@ if TURSO_URL and TURSO_TOKEN:
 
 class PlatformHandler(SimpleHTTPRequestHandler):
     """معالج طلبات الموقع وواجهات البرمجة المرتبطة بـ Turso."""
+
+    def end_headers(self):
+        self.send_header('Connection', 'close')
+        super().end_headers()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=WEBSITE_DIR, **kwargs)
@@ -733,7 +737,7 @@ class PlatformHandler(SimpleHTTPRequestHandler):
 
 def run():
     server_address = ("", PORT)
-    httpd = HTTPServer(server_address, PlatformHandler)
+    httpd = ThreadingHTTPServer(server_address, PlatformHandler)
     print(f"🚀 خادم المنصة التعليمية جاهز ويعمل على: http://localhost:{PORT}")
     print(f"📁 مسار الموقع: {WEBSITE_DIR}")
     try:

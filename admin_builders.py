@@ -79,36 +79,72 @@ def build_web_wait_list(rows):
     return text, _back(markup)
 
 
-# ------------------- 2. قائمة المفعلين مع الرمز السري -------------------
-def build_users_list(rows):
+# ------------------- 2. قوائم المفعلين مفصولة (تلاميذ البوت وحدها وتلاميذ الموقع وحدها) -------------------
+def build_bot_users_list(rows):
+    """عرض تلاميذ بوت التلغرام المفعلين فقط (الهاتف) مع إمكانية مراسلتهم بالـ ID مباشرة."""
     markup = InlineKeyboardMarkup()
-    text = f"📊 **قائمة التلاميذ المفعلين ({len(rows)} تلميذ):**\n\n"
+    text = f"🤖 **قائمة تلاميذ بوت التلغرام المفعلين ({len(rows)} تلميذ):**\n"
+    text += "📱 *(مسجلون عبر الهاتف - يمكنك مراسلتهم بالـ ID وتفقد نشاطهم)*\n\n"
     if not rows:
-        return "🚫 لا يوجد تلاميذ مفعلين حالياً.", _back(markup)
+        return "🚫 لا يوجد تلاميذ مفعلين في بوت التلغرام حالياً.", _back(markup)
     for r in rows[:MAX_ROWS]:
         user_id = r[0]
         name = r[1]
         school = r[2]
         last_active = r[3]
-        joined_at = r[4]
         phone = r[5] if len(r) > 5 and r[5] else "غير مسجل"
         code = r[6] if len(r) > 6 and r[6] else "—"
-        source = r[7] if len(r) > 7 and r[7] else "bot"
-        src_label = "🤖 بوت" if source == "bot" else "🌐 موقع"
 
-        text += f"👤 *{esc(name)}* | 🏷️ {src_label}\n"
+        text += f"👤 *{esc(name)}* | 🆔 `{user_id}`\n"
         text += f"📱 الهاتف: `{phone}` | 🔑 الرمز السري: `{code}`\n"
-        text += f"🏫 {esc(school)} | 🆔 `{user_id}`\n"
+        text += f"🏫 {esc(school)}\n"
         text += f"🕒 آخر ظهور: {last_active or '—'}\n"
         text += f"──────────────────\n"
         markup.add(
-            InlineKeyboardButton(f"📅 النشاط", callback_data=f"UD_{user_id}"),
-            InlineKeyboardButton(f"✉️ مراسلة", callback_data=f"msg_user_{user_id}"),
-            InlineKeyboardButton("❌ حذف", callback_data=f"del_user_{user_id}")
+            InlineKeyboardButton("📅 النشاط", callback_data=f"UD_{user_id}"),
+            InlineKeyboardButton("✉️ مراسلة بالـ ID", callback_data=f"msg_user_{user_id}"),
+            InlineKeyboardButton("❌ حذف من البوت", callback_data=f"del_user_{user_id}")
         )
     if len(rows) > MAX_ROWS:
         text += f"… (يُعرض أول {MAX_ROWS} من {len(rows)})\n"
+    markup.add(InlineKeyboardButton("💻 الانتقال لتلاميذ الموقع الإلكتروني 🌐", callback_data="web_users_menu"))
     return text, _back(markup)
+
+
+def build_web_users_list(rows):
+    """عرض تلاميذ الموقع الإلكتروني المفعلين فقط (الحاسوب/الويب) مستقلين تماماً."""
+    markup = InlineKeyboardMarkup()
+    text = f"💻 **قائمة تلاميذ الموقع الإلكتروني المفعلين ({len(rows)} تلميذ):**\n"
+    text += "🌐 *(مسجلون عبر الموقع والحاسوب)*\n\n"
+    if not rows:
+        return "🚫 لا يوجد تلاميذ مفعلين في الموقع الإلكتروني حالياً.", _back(markup)
+    for r in rows[:MAX_ROWS]:
+        wid = r[0]
+        name = f"{r[1]} {r[2]}".strip()
+        school = r[3] or "دراسة عن بعد 🌐"
+        branch = r[4] or ""
+        phone = r[5] or "غير مسجل"
+        code = r[6] or "—"
+        created_at = r[7] or "—"
+
+        sch_text = f"{school} ({branch})" if branch else school
+        text += f"👤 *{esc(name)}* | 💻 رقم العضوية: `W-{wid}`\n"
+        text += f"📱 الهاتف: `{phone}` | 🔑 الرمز السري: `{code}`\n"
+        text += f"🏫 {esc(sch_text)}\n"
+        text += f"🗓️ تاريخ التسجيل: {created_at}\n"
+        text += f"──────────────────\n"
+        markup.add(
+            InlineKeyboardButton("💬 مراسلة التلميذ", callback_data=f"reply_chat_{wid}"),
+            InlineKeyboardButton("🚫 حظر من الموقع", callback_data=f"del_web_wait_{wid}")
+        )
+    if len(rows) > MAX_ROWS:
+        text += f"… (يُعرض أول {MAX_ROWS} من {len(rows)})\n"
+    markup.add(InlineKeyboardButton("📱 الانتقال لتلاميذ بوت التلغرام 🤖", callback_data="bot_users"))
+    return text, _back(markup)
+
+
+def build_users_list(rows):
+    return build_bot_users_list(rows)
 
 
 def build_student_info_card(student):

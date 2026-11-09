@@ -27,7 +27,7 @@ from db import conn, cursor, get_setting, set_setting, db_lock
 from utils import first_in_album
 from admin_builders import (
     esc, _back,
-    build_wait_list, build_web_wait_list, build_student_info_card, build_users_list, build_schools_menu, build_school_users_list,
+    build_wait_list, build_web_wait_list, build_student_info_card, build_users_list, build_bot_users_list, build_web_users_list, build_schools_menu, build_school_users_list,
     build_deleted_list, build_ranking_list, build_quick_delete_list, build_quick_restore_list,
     build_units_management, build_unit_content_management, build_homework_management,
     build_unit_homework_list, build_bac_admin_menu, build_files_folders_admin,
@@ -63,6 +63,33 @@ def get_bot_phones():
         except Exception:
             pass
     return b_phones
+
+
+def get_bot_users_list():
+    """جلب قائمة تلاميذ بوت التلغرام المفعلين فقط (مسجلون عبر الهاتف)."""
+    with db_lock:
+        try:
+            cursor.execute("SELECT user_id, full_name, school, last_active, joined_at, phone, code, source FROM users ORDER BY user_id DESC")
+            return cursor.fetchall()
+        except Exception as e:
+            print("get_bot_users_list error:", e)
+            return []
+
+
+def get_web_active_users_list():
+    """جلب قائمة تلاميذ الموقع الإلكتروني المفعلين فقط (مسجلون عبر الحاسوب)."""
+    try:
+        from web_server import turso_client
+        if turso_client:
+            return turso_client.execute("""
+                SELECT id, first_name, last_name, school, branch, phone, code, created_at, active
+                FROM web_users
+                WHERE active = 1
+                ORDER BY id DESC
+            """)
+    except Exception as e:
+        print("get_web_active_users_list error:", e)
+    return []
 
 
 def get_users_list():
@@ -249,21 +276,29 @@ def restore_user_by_id(user_id):
 
 # ===================== القوائم الرئيسية للأدمن =====================
 def admin_main_menu():
-    users_count = len(get_users_list())
-    wait_count = len(get_wait_list())
+    bot_users_count = len(get_bot_users_list())
+    web_users_count = len(get_web_active_users_list())
+    bot_wait_count = len(get_wait_list())
+    web_wait_count = len(get_web_wait_list())
     deleted_count = len(get_deleted_users_list())
     unread_chat = db.get_unread_chat_count(ADMIN_ID)
     chat_badge = f" ({unread_chat} جديد)" if unread_chat > 0 else ""
 
     markup = InlineKeyboardMarkup(row_width=2)
-    web_wait_count = len(get_web_wait_list())
+    # الصف 1: قوائم الانتظار مفصولة
     markup.add(
-        InlineKeyboardButton(f"⏳ قائمة انتظار البوت ({wait_count})", callback_data="wait"),
-        InlineKeyboardButton(f"🌐 قائمة انتظار الموقع ({web_wait_count})", callback_data="web_wait_menu")
+        InlineKeyboardButton(f"⏳ انتظار البوت 📱 ({bot_wait_count})", callback_data="wait"),
+        InlineKeyboardButton(f"🌐 انتظار الموقع 💻 ({web_wait_count})", callback_data="web_wait_menu")
     )
+    # الصف 2: قوائم المفعلين مفصولة تماماً (كل فئة وحدها)
     markup.add(
-        InlineKeyboardButton(f"📊 المفعلين ({users_count})", callback_data="users"),
-        InlineKeyboardButton("🔑 كشف الرموز السرية والأرقام", callback_data="secret_codes_menu_0")
+        InlineKeyboardButton(f"🤖 تلاميذ البوت 📱 ({bot_users_count})", callback_data="bot_users"),
+        InlineKeyboardButton(f"💻 تلاميذ الموقع 🌐 ({web_users_count})", callback_data="web_users_menu")
+    )
+    # الصف 3: كشف الرموز مفصول لكل فئة
+    markup.add(
+        InlineKeyboardButton("🔑 رموز تلاميذ البوت 📱", callback_data="secret_codes_bot_0"),
+        InlineKeyboardButton("🔑 رموز تلاميذ الموقع 💻", callback_data="secret_codes_web_0")
     )
     markup.add(
         InlineKeyboardButton("⚙️ تسيير الوحدات والدروس", callback_data="manage_units_control"),
@@ -554,14 +589,38 @@ def handle_admin_callback(bot, call):
                 text, markup = build_wait_list(rows, "del_wait")
                 bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
 
-        # ----------------- 2. قائمة المفعلين -----------------
-        elif data == "users":
-            rows = get_users_list()
+        # ----------------- 2. قوائم المفعلين مفصولة -----------------
+        elif data in ("bot_users", "users"):
+            rows = get_bot_users_list()
             if not rows:
-                bot.edit_message_text("🚫 لا يوجد تلاميذ مفعلين حالياً.", chat_id=chat_id, message_id=msg_id, reply_markup=admin_main_menu(), parse_mode="Markdown")
+                bot.edit_message_text("🚫 لا يوجد تلاميذ مفعلين في بوت التلغرام حالياً.", chat_id=chat_id, message_id=msg_id, reply_markup=admin_main_menu(), parse_mode="Markdown")
                 return
-            text, markup = build_users_list(rows)
+            text, markup = build_bot_users_list(rows)
             bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif data == "web_users_menu":
+            rows = get_web_active_users_list()
+            if not rows:
+                bot.edit_message_text("🚫 لا يوجد تلاميذ مفعلين في الموقع الإلكتروني حالياً.", chat_id=chat_id, message_id=msg_id, reply_markup=admin_main_menu(), parse_mode="Markdown")
+                return
+            text, markup = build_web_users_list(rows)
+            bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif data.startswith("secret_codes_bot_"):
+            page = int(data.split("_")[-1])
+            text, markup = build_bot_secret_codes_page(page)
+            try:
+                bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
+            except Exception:
+                pass
+
+        elif data.startswith("secret_codes_web_"):
+            page = int(data.split("_")[-1])
+            text, markup = build_web_secret_codes_page(page)
+            try:
+                bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
+            except Exception:
+                pass
 
         elif data.startswith("del_user_"):
             raw_target = data.replace("del_user_", "").strip()
@@ -2272,6 +2331,130 @@ def get_all_students_for_codes():
             print("get_all_students_for_codes local error:", e)
 
     return all_st
+
+
+def build_bot_secret_codes_page(page=0, page_size=8):
+    """كشف أرقام ورموز تلاميذ بوت التلغرام فقط (الهاتف)."""
+    students = []
+    with db_lock:
+        cursor.execute("SELECT user_id, full_name, school, phone, code FROM users ORDER BY user_id DESC")
+        for r in cursor.fetchall():
+            students.append({
+                "id": str(r[0]),
+                "name": r[1],
+                "school": r[2],
+                "phone": r[3] if len(r) > 3 and r[3] else "غير مسجل",
+                "code": r[4] if len(r) > 4 and r[4] else "—",
+                "status": "🟢 مفعل في البوت"
+            })
+        cursor.execute("SELECT user_id, full_name, school, phone, code FROM wait WHERE (source = 'bot' OR source IS NULL) ORDER BY user_id DESC")
+        for r in cursor.fetchall():
+            students.append({
+                "id": str(r[0]),
+                "name": r[1],
+                "school": r[2],
+                "phone": r[3] if len(r) > 3 and r[3] else "غير مسجل",
+                "code": r[4] if len(r) > 4 and r[4] else "—",
+                "status": "🟡 انتظار في البوت"
+            })
+
+    total = len(students)
+    start = page * page_size
+    end = start + page_size
+    current_items = students[start:end]
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    text = f"🔑 **قائمة رموز وأرقام تلاميذ بوت التلغرام (📱 الهاتف):**\n"
+    text += f"📊 إجمالي تلاميذ البوت: **{total}** | الصفحة: **{page + 1} من {total_pages}**\n"
+    text += f"──────────────────\n\n"
+
+    if not current_items:
+        text += "🚫 لا توجد بيانات لتلاميذ البوت حالياً.\n"
+    else:
+        for idx, s in enumerate(current_items, start=start + 1):
+            text += f"{idx}. 👤 *{esc(s['name'])}* | {s['status']}\n"
+            text += f"   📱 الهاتف: `{s['phone']}`\n"
+            text += f"   🔑 الرمز السري: `{s['code']}`\n"
+            text += f"   🏫 {esc(s['school'])} | 🆔 `{s['id']}`\n"
+            text += f"──────────────────\n"
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🔍 بحث عن تلميذ بالاسم/الرقم/ID", callback_data="find_student_code"))
+    nav_btns = []
+    if page > 0:
+        nav_btns.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"secret_codes_bot_{page - 1}"))
+    nav_btns.append(InlineKeyboardButton(f"📄 {page + 1} / {total_pages}", callback_data="ignore_click"))
+    if end < total:
+        nav_btns.append(InlineKeyboardButton("التالي ➡️", callback_data=f"secret_codes_bot_{page + 1}"))
+    if nav_btns:
+        markup.row(*nav_btns)
+    markup.add(InlineKeyboardButton("💻 فتح رموز تلاميذ الموقع", callback_data="secret_codes_web_0"))
+    markup.add(InlineKeyboardButton("🔙 العودة للوحة التحكم", callback_data="admin_home"))
+    return text, markup
+
+
+def build_web_secret_codes_page(page=0, page_size=8):
+    """كشف أرقام ورموز تلاميذ الموقع الإلكتروني فقط (الحاسوب)."""
+    students = []
+    try:
+        from web_server import turso_client
+        if turso_client:
+            web_rows = turso_client.execute("""
+                SELECT id, first_name, last_name, phone, school, branch, code, active
+                FROM web_users
+                ORDER BY id DESC
+            """)
+            for r in web_rows:
+                act = int(r[7] or 0)
+                st_icon = "🟢 مفعل بالموقع" if act == 1 else ("🔴 محظور بالموقع" if act == -1 else "🟡 انتظار بالموقع")
+                students.append({
+                    "id": f"W-{r[0]}",
+                    "name": f"{r[1]} {r[2]}".strip(),
+                    "phone": r[3] or "غير مسجل",
+                    "code": r[6] or "—",
+                    "school": r[4] or "دراسة عن بعد 🌐",
+                    "branch": r[5] or "",
+                    "status": st_icon
+                })
+    except Exception as e:
+        print("build_web_secret_codes_page error:", e)
+
+    total = len(students)
+    start = page * page_size
+    end = start + page_size
+    current_items = students[start:end]
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    text = f"🔑 **قائمة رموز وأرقام تلاميذ الموقع الإلكتروني (💻 الحاسوب):**\n"
+    text += f"📊 إجمالي تلاميذ الموقع: **{total}** | الصفحة: **{page + 1} من {total_pages}**\n"
+    text += f"──────────────────\n\n"
+
+    if not current_items:
+        text += "🚫 لا توجد بيانات لتلاميذ الموقع حالياً.\n"
+    else:
+        for idx, s in enumerate(current_items, start=start + 1):
+            sch_text = s['school']
+            if s.get('branch'):
+                sch_text += f" ({s['branch']})"
+            text += f"{idx}. 👤 *{esc(s['name'])}* | {s['status']}\n"
+            text += f"   📱 الهاتف: `{s['phone']}`\n"
+            text += f"   🔑 الرمز السري: `{s['code']}`\n"
+            text += f"   🏫 {esc(sch_text)} | 💻 `{s['id']}`\n"
+            text += f"──────────────────\n"
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🔍 بحث عن تلميذ بالاسم/الرقم/ID", callback_data="find_student_code"))
+    nav_btns = []
+    if page > 0:
+        nav_btns.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"secret_codes_web_{page - 1}"))
+    nav_btns.append(InlineKeyboardButton(f"📄 {page + 1} / {total_pages}", callback_data="ignore_click"))
+    if end < total:
+        nav_btns.append(InlineKeyboardButton("التالي ➡️", callback_data=f"secret_codes_web_{page + 1}"))
+    if nav_btns:
+        markup.row(*nav_btns)
+    markup.add(InlineKeyboardButton("📱 فتح رموز تلاميذ البوت", callback_data="secret_codes_bot_0"))
+    markup.add(InlineKeyboardButton("🔙 العودة للوحة التحكم", callback_data="admin_home"))
+    return text, markup
 
 
 def build_secret_codes_page(page=0, page_size=8):

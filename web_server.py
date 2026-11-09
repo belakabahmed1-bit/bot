@@ -60,7 +60,7 @@ def _do_telegram_notification(first_name, last_name, phone, school, branch, code
         status_text = "مفعّل تلقائياً بكود مسبق ✅" if is_active == 1 else "قيد الانتظار للمراجعة ⏳"
         msg = (
             f"🔔 **طلب تسجيل جديد!**\n\n"
-            f"🏷️ **المصدر:** 🌐 الموقع الإلكتروني\n"
+            f"🏷️ **المصدر:** 💻 الموقع الإلكتروني (الحاسوب)\n"
             f"👤 **الاسم واللقب:** {full_name}\n"
             f"📱 **رقم الهاتف:** `{phone}`\n"
             f"🔑 **الرمز السري:** `{code}`\n"
@@ -73,7 +73,7 @@ def _do_telegram_notification(first_name, last_name, phone, school, branch, code
         reply_markup = {
             "inline_keyboard": [
                 [
-                    {"text": f"✅ قبول وتفعيل {full_name}", "callback_data": f"ok_web_phone_{phone}"},
+                    {"text": f"✅ تفعيل تلميذ الموقع {full_name}", "callback_data": f"ok_web_phone_{phone}"},
                     {"text": "❌ طرد / رفض", "callback_data": f"del_web_phone_{phone}"}
                 ]
             ]

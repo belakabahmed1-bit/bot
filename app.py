@@ -288,13 +288,13 @@ def process_registration(message):
         try:
             markup_adm = InlineKeyboardMarkup()
             markup_adm.add(
-                InlineKeyboardButton(f"✅ قبول {full_name}", callback_data=f"ok_wait_{uid}"),
+                InlineKeyboardButton(f"✅ تفعيل تلميذ البوت {full_name}", callback_data=f"ok_wait_{uid}"),
                 InlineKeyboardButton("❌ رفض وطرد", callback_data=f"del_wait_{uid}")
             )
             bot.send_message(
                 ADMIN_ID,
                 f"🔔 **طلب تسجيل جديد!**\n\n"
-                f"🏷️ **المصدر:** 🤖 بوت التلغرام\n"
+                f"🏷️ **المصدر:** 🤖 بوت التلغرام (📱 الهاتف)\n"
                 f"👤 **الاسم واللقب:** {full_name}\n"
                 f"📱 **رقم الهاتف:** `{phone}`\n"
                 f"🏫 **المدرسة:** {text}\n"

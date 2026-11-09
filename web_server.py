@@ -40,8 +40,7 @@ def generate_activation_code():
     chars = string.ascii_uppercase + string.digits
     return ''.join(secrets.choice(chars) for _ in range(6))
 
-def notify_admin_website_registration(first_name, last_name, phone, school, branch, code, now, is_active):
-    """إرسال إشعار تلغرام فوري للأستاذ عند تسجيل تلميذ جديد من الموقع الإلكتروني."""
+def _do_telegram_notification(first_name, last_name, phone, school, branch, code, now, is_active):
     token = os.getenv("BOT_TOKEN")
     if not token:
         return
@@ -85,6 +84,11 @@ def notify_admin_website_registration(first_name, last_name, phone, school, bran
     except Exception as e:
         print("notify_admin_website_registration error:", e)
 
+def notify_admin_website_registration(*args):
+    """إرسال إشعار تلغرام فوري للأستاذ في خيط معالجة خلفي سريع دون تأخير المتصفح"""
+    import threading
+    threading.Thread(target=_do_telegram_notification, args=args, daemon=True).start()
+
 
 # محاولة تحميل ملف .env
 def _load_dotenv():
@@ -127,73 +131,109 @@ PORT = int(os.environ.get("PORT", 5000))
 TURSO_URL = os.getenv("TURSO_DB_URL", "")
 TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
 
-# عميل موحد للاتصال بـ Turso عبر HTTP Pipeline API المباشر
+# عميل موحد فائق السرعة لقاعدة البيانات (Local-First + Async Cloud Sync)
 class TursoHTTPClient:
-    def __init__(self, db_url, auth_token):
-        self.endpoint = db_url.replace("libsql://", "https://").rstrip("/") + "/v2/pipeline"
-        self.headers = {
-            "Authorization": f"Bearer {auth_token}",
-            "Content-Type": "application/json"
-        }
+    def __init__(self, db_url=None, auth_token=None):
+        self.endpoint = (db_url or "").replace("libsql://", "https://").rstrip("/") + "/v2/pipeline" if db_url else ""
+        self.auth_token = auth_token or ""
+        self.session = None
+        if self.endpoint and self.auth_token:
+            try:
+                import requests
+                self.session = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(pool_connections=15, pool_maxsize=15, max_retries=1)
+                self.session.mount("https://", adapter)
+                self.session.mount("http://", adapter)
+            except Exception:
+                pass
+        self._ensure_local_schema()
+
+    def _ensure_local_schema(self):
+        try:
+            import sqlite3
+            db_path = os.path.join(CURRENT_DIR if os.path.basename(CURRENT_DIR) != "website" else PARENT_DIR, "bot.db")
+            conn = sqlite3.connect(db_path, timeout=5)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS web_users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    phone TEXT UNIQUE,
+                    branch TEXT,
+                    school TEXT,
+                    pw_hash TEXT,
+                    code TEXT,
+                    active INTEGER DEFAULT 0,
+                    created_at TEXT
+                );
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print("Local schema init error:", e)
+
+    def _local_execute(self, sql, params=None):
+        import sqlite3
+        db_path = os.path.join(CURRENT_DIR if os.path.basename(CURRENT_DIR) != "website" else PARENT_DIR, "bot.db")
+        conn = sqlite3.connect(db_path, timeout=5)
+        try:
+            cur = conn.cursor()
+            if params:
+                cur.execute(sql, params)
+            else:
+                cur.execute(sql)
+            if sql.strip().upper().startswith("SELECT"):
+                rows = cur.fetchall()
+                return [list(r) for r in rows]
+            else:
+                conn.commit()
+                return cur.rowcount
+        except Exception as e:
+            print(f"Local DB query error ({sql[:30]}...):", e)
+            return []
+        finally:
+            conn.close()
+
+    def _cloud_sync(self, sql, params=None):
+        if not self.session or not self.endpoint or not self.auth_token:
+            return
+        try:
+            stmt = {"sql": sql}
+            if params:
+                args = []
+                for p in params:
+                    if isinstance(p, int):
+                        args.append({"type": "integer", "value": str(p)})
+                    elif isinstance(p, float):
+                        args.append({"type": "float", "value": p})
+                    elif p is None:
+                        args.append({"type": "null"})
+                    else:
+                        args.append({"type": "text", "value": str(p)})
+                stmt["args"] = args
+
+            payload = {"requests": [{"type": "execute", "stmt": stmt}]}
+            headers = {
+                "Authorization": f"Bearer {self.auth_token}",
+                "Content-Type": "application/json"
+            }
+            self.session.post(self.endpoint, headers=headers, json=payload, timeout=3.5)
+        except Exception:
+            pass
 
     def execute(self, sql, params=None):
-        import requests
-        stmt = {"sql": sql}
-        if params:
-            args = []
-            for p in params:
-                if isinstance(p, int):
-                    args.append({"type": "integer", "value": str(p)})
-                elif isinstance(p, float):
-                    args.append({"type": "float", "value": p})
-                elif p is None:
-                    args.append({"type": "null"})
-                else:
-                    args.append({"type": "text", "value": str(p)})
-            stmt["args"] = args
+        clean_sql = sql.strip().upper()
+        if clean_sql.startswith("SELECT"):
+            return self._local_execute(sql, params)
 
-        payload = {"requests": [{"type": "execute", "stmt": stmt}, {"type": "close"}]}
-        try:
-            res = requests.post(self.endpoint, headers=self.headers, json=payload, timeout=12).json()
-            r0 = res.get("results", [{}])[0]
-            if r0.get("type") == "ok":
-                result = r0.get("response", {}).get("result", {})
-                rows = []
-                for row in result.get("rows", []):
-                    rows.append([col.get("value") for col in row])
-                return rows
-            else:
-                print("Turso HTTP query error:", r0)
-                return []
-        except Exception as e:
-            print("Turso HTTP connection error:", e)
-            return []
+        res = self._local_execute(sql, params)
+        if self.session and self.endpoint and self.auth_token:
+            import threading
+            threading.Thread(target=self._cloud_sync, args=(sql, params), daemon=True).start()
+        return res
 
-
-turso_client = None
-if TURSO_URL and TURSO_TOKEN:
-    try:
-        turso_client = TursoHTTPClient(TURSO_URL, TURSO_TOKEN)
-        # التأكد من جدول web_users بالهيكل الدقيق
-        turso_client.execute("""
-            CREATE TABLE IF NOT EXISTS web_users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                first_name TEXT,
-                last_name TEXT,
-                phone TEXT UNIQUE,
-                branch TEXT,
-                school TEXT,
-                pw_hash TEXT,
-                code TEXT,
-                active INTEGER DEFAULT 0,
-                created_at TEXT
-            );
-        """)
-        test_rows = turso_client.execute("SELECT count(*) FROM units")
-        if test_rows:
-            print(f"✅ [Turso] تم الاتصال بقاعدة بيانات Turso السحابية بنجاح! عدد الوحدات: {test_rows[0][0]}")
-    except Exception as e:
-        print("❌ [Turso] تعذر الاتصال بـ Turso:", e)
+turso_client = TursoHTTPClient(TURSO_URL, TURSO_TOKEN)
 
 
 class PlatformHandler(SimpleHTTPRequestHandler):
@@ -234,8 +274,18 @@ class PlatformHandler(SimpleHTTPRequestHandler):
         path = parsed.path
         params = parse_qs(parsed.query)
 
-        # ---------------- 1. API: قائمة الوحدات من Turso ----------------
-        if path == "/api/units":
+                # ---------------- 🔑 0. API: فحص حالة الحساب اللحظية (طرد فوري عند الحظر) ----------------
+        if path == "/api/auth/status":
+            phone = params.get("phone", [None])[0]
+            if not phone:
+                return self._send_json({"active": 0})
+            rows = turso_client.execute("SELECT active FROM web_users WHERE phone = ?", [phone])
+            if rows:
+                return self._send_json({"active": int(rows[0][0])})
+            return self._send_json({"active": 0})
+
+# ---------------- 1. API: قائمة الوحدات من Turso ----------------
+        elif path == "/api/units":
             if turso_client:
                 rows = turso_client.execute("SELECT id, name FROM units WHERE is_active=1 ORDER BY id ASC")
                 if rows:

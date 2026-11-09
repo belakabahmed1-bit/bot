@@ -801,10 +801,8 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                         "user": user_obj
                     }, cookie=cookie_str)
                 else:
-                    return self._send_json({
-                        "success": False,
-                        "error": "الرمز السري غير صحيح. يرجى التأكد من الرمز الممنوح لك في بوت التليجرام."
-                    })
+                    # الرمز لم يتطابق مع جدول web_users القديم، نفحص جدول البوت users أو wait فقد يكون التلميذ أنشأ رمزاً جديداً في البوت
+                    pass
 
             # 3. فحص المفعلين أو المنتظرين في بوت التلغرام المحلي
             try:
@@ -821,12 +819,17 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                             ln_val = parts[1] if len(parts) > 1 else ""
                             c_val = cd_bot or generate_activation_code()
                             pw_val = hash_password(c_val)
+                            # تحديث السجل الحالي في web_users برمز البوت الجديد
                             turso_client.execute("""
-                                INSERT OR REPLACE INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
-                                VALUES (?, ?, ?, 'شعبة عامة', ?, ?, ?, 1, ?)
-                            """, [fn_val, ln_val, phone, sch_bot or "دراسة عن بعد 🌐", pw_val, c_val, now])
-                            
+                                UPDATE web_users SET code = ?, pw_hash = ?, active = 1 WHERE phone = ?
+                            """, [c_val, pw_val, phone])
                             w_res = turso_client.execute("SELECT id FROM web_users WHERE phone = ?", [phone])
+                            if not w_res:
+                                turso_client.execute("""
+                                    INSERT INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
+                                    VALUES (?, ?, ?, 'شعبة عامة', ?, ?, ?, 1, ?)
+                                """, [fn_val, ln_val, phone, sch_bot or "دراسة عن بعد 🌐", pw_val, c_val, now])
+                                w_res = turso_client.execute("SELECT id FROM web_users WHERE phone = ?", [phone])
                             new_id = w_res[0][0] if w_res else uid_bot
 
                             user_obj = {

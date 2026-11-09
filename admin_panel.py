@@ -1,9 +1,11 @@
 
 def get_web_wait_list():
     try:
+        bot_phones = get_bot_phones()
         from web_server import turso_client
         if turso_client:
-            return turso_client.execute("SELECT id, first_name, last_name, phone, school, branch, code, created_at FROM web_users WHERE active = 0 ORDER BY id DESC")
+            rows = turso_client.execute("SELECT id, first_name, last_name, phone, school, branch, code, created_at FROM web_users WHERE active = 0 ORDER BY id DESC")
+            return [r for r in rows if (r[3] and r[3] not in bot_phones)]
     except Exception as e:
         print("get_web_wait_list error:", e)
     return []
@@ -77,16 +79,19 @@ def get_bot_users_list():
 
 
 def get_web_active_users_list():
-    """جلب قائمة تلاميذ الموقع الإلكتروني المفعلين فقط (مسجلون عبر الحاسوب)."""
+    """جلب قائمة تلاميذ الموقع الإلكتروني المفعلين فقط (الحاسوب) مع منع أي تكرار لتلاميذ البوت."""
     try:
+        bot_phones = get_bot_phones()
         from web_server import turso_client
         if turso_client:
-            return turso_client.execute("""
+            rows = turso_client.execute("""
                 SELECT id, first_name, last_name, school, branch, phone, code, created_at, active
                 FROM web_users
                 WHERE active = 1
                 ORDER BY id DESC
             """)
+            # استبعاد أي تلميذ مسجل أصلاً من البوت ليبقى حصراً في قائمة تلاميذ البوت
+            return [r for r in rows if (r[5] and r[5] not in bot_phones)]
     except Exception as e:
         print("get_web_active_users_list error:", e)
     return []
@@ -2407,6 +2412,8 @@ def build_web_secret_codes_page(page=0, page_size=8):
             for r in web_rows:
                 act = int(r[7] or 0)
                 st_icon = "🟢 مفعل بالموقع" if act == 1 else ("🔴 محظور بالموقع" if act == -1 else "🟡 انتظار بالموقع")
+                if r[3] and r[3] in bot_phones:
+                    continue
                 students.append({
                     "id": f"W-{r[0]}",
                     "name": f"{r[1]} {r[2]}".strip(),

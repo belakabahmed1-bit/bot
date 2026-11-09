@@ -178,7 +178,7 @@ def process_registration(message):
     if not text:
         return
 
-    # خطوة الاسم واللقب (إجبار الحروف العربية فقط)
+    # 1. خطوة الاسم واللقب (إجبار الحروف العربية فقط)
     if step == "full_name":
         if not is_valid_arabic_name(text):
             bot.send_message(
@@ -191,15 +191,46 @@ def process_registration(message):
             return
 
         temp_data[uid] = {"full_name": text}
+        user_steps[uid] = "phone"
+        bot.send_message(
+            message.chat.id,
+            "📱 **الخطوة 2 من 3: أدخل رقم هاتفك المحمول:**\n"
+            "✏️ (مثال: `0555123456` أو `0666123456` أو `0777123456`)\n\n"
+            "💡 *هذا الرقم ستستخدمه للدخول إلى موقع الأستاذ بلعقاب أسامة مع الرمز السري الخاص بك.*",
+            parse_mode="Markdown"
+        )
+
+    # 2. خطوة رقم الهاتف
+    elif step == "phone":
+        import re
+        clean_phone = re.sub(r'[\s\-\(\)]', '', text)
+        if clean_phone.startswith("+213"):
+            clean_phone = "0" + clean_phone[4:]
+        elif clean_phone.startswith("00213"):
+            clean_phone = "0" + clean_phone[5:]
+
+        if not re.match(r"^0[567][0-9]{8}$", clean_phone):
+            bot.send_message(
+                message.chat.id,
+                "⚠️ **رقم الهاتف غير صحيح!**\n\n"
+                "يرجى إدخال رقم هاتف جزائري صالح يتكون من 10 أرقام ويبدأ بـ (05 أو 06 أو 07):\n"
+                "✏️ (مثال: `0555123456`):",
+                parse_mode="Markdown"
+            )
+            return
+
+        if uid not in temp_data:
+            temp_data[uid] = {}
+        temp_data[uid]["phone"] = clean_phone
         user_steps[uid] = "school"
         bot.send_message(
             message.chat.id,
-            "🏫 **اختر المدرسة التي تدرس فيها من الأزرار أدناه:**",
+            "🏫 **الخطوة 3 من 3: اختر المدرسة التي تدرس فيها من الأزرار أدناه:**",
             reply_markup=schools_keyboard(),
             parse_mode="Markdown"
         )
 
-    # خطوة اختيار المدرسة
+    # 3. خطوة اختيار المدرسة
     elif step == "school":
         if text not in SCHOOLS:
             bot.send_message(
@@ -216,13 +247,14 @@ def process_registration(message):
             return
 
         full_name = d["full_name"]
+        phone = d.get("phone", "")
         code = generate_code()
         from datetime import datetime
         now_time = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         cursor.execute(
-            "INSERT OR REPLACE INTO wait (user_id, full_name, school, code, created_at) VALUES (?, ?, ?, ?, ?)",
-            (uid, full_name, text, code, now_time)
+            "INSERT OR REPLACE INTO wait (user_id, full_name, school, code, created_at, phone) VALUES (?, ?, ?, ?, ?, ?)",
+            (uid, full_name, text, code, now_time, phone)
         )
         conn.commit()
 
@@ -232,9 +264,10 @@ def process_registration(message):
             message.chat.id,
             f"✅ **تم تسجيل بياناتك بنجاح!**\n\n"
             f"👤 **الاسم واللقب:** {full_name}\n"
+            f"📱 **رقم الهاتف:** `{phone}`\n"
             f"🏫 **المدرسة:** {text}\n\n"
             "🔐 **درك بقاتلك خطوة تفعيل الكود:**\n"
-            "باش تتحصل على كود التفعيل، ابعث رسالة للأستاذ أسامة في حسابه إنستغرام 📩\n\n"
+            "باش تتحصل على كود التفعيل والرمز السري، ابعث رسالة للأستاذ أسامة في حسابه إنستغرام 📩\n\n"
             "كليكي على الزر التحتاني باش تروح لصفحته وكي يعطيك الكود اكتبو هنا في البوت:",
             reply_markup=ReplyKeyboardRemove(),
             parse_mode="Markdown"
@@ -245,9 +278,9 @@ def process_registration(message):
             reply_markup=instagram_markup()
         )
 
-    # خطوة إدخال كود التفعيل
+    # 4. خطوة إدخال كود التفعيل
     elif step == "activate":
-        data = get_wait(uid)  # (user_id, full_name, school, code, created_at)
+        data = get_wait(uid)  # (user_id, full_name, school, code, created_at, phone)
         if not data:
             user_steps.pop(uid, None)
             if get_user(uid):
@@ -261,12 +294,19 @@ def process_registration(message):
             return
 
         if text.strip().upper() == data[3].strip().upper():
-            activate_from_wait(uid)
+            res = activate_from_wait(uid)
+            phone_val = (res.get("phone") if isinstance(res, dict) else "") or (data[5] if len(data) > 5 else "")
+            code_val = (res.get("code") if isinstance(res, dict) else "") or data[3]
+
             bot.send_message(
                 uid,
-                "🎉 **بصحتك! تفعل حسابك بنجاح 🚀**\n\n"
-                "مرحبا بيك في عائلة الرياضيات مع **الأستاذ بلعقاب أسامة**، ربي يوفقك ويفرحنا بنجاحك في الباك بالامتياز 🎓✨\n\n"
-                "📐 *«المات مع أسامة في سلامة.. تقدرولهااااا خاوتي!»* 💪",
+                f"🎉 **بصحتك! تفعل حسابك بنجاح في البوت والموقع 🚀**\n\n"
+                f"مرحبا بيك في عائلة الرياضيات مع **الأستاذ بلعقاب أسامة**، ربي يوفقك ويفرحنا بنجاحك في الباك بالامتياز 🎓✨\n\n"
+                f"🌐 **بيانات تسجيل دخولك لموقع الأستاذ الإلكتروني:**\n"
+                f"📱 **رقم الهاتف:** `{phone_val}`\n"
+                f"🔑 **الرمز السري:** `{code_val}`\n\n"
+                f"⚠️ **تنبيه:** هذا الرمز السري دائم وخاص بك ولا يمكن تغييره. استعمله دائماً لتسجيل الدخول إلى الموقع وتصفح كافة الدروس والتمارين والفيديوهات 📐\n\n"
+                f"📐 *«المات مع أسامة في سلامة.. تقدرولهااااا خاوتي!»* 💪",
                 reply_markup=main_menu(uid),
                 parse_mode="Markdown"
             )
@@ -293,6 +333,16 @@ def admin_callbacks(call):
 if __name__ == "__main__":
     print("Bot starting...")
     start_file_sync(bot)   # نسخ الملفات والصور إلى Turso للموقع
+
+    # تشغيل خادم الموقع الإلكتروني المدمج في الخلفية (مرتبط بـ Turso)
+    try:
+        import threading
+        from web_server import run as run_web_server
+        web_thread = threading.Thread(target=run_web_server, daemon=True)
+        web_thread.start()
+        print(f"Web server started on port {os.environ.get('PORT', 5000)}")
+    except Exception as e:
+        print("Web server startup error:", e)
     try:
         bot.delete_webhook(drop_pending_updates=True)
     except Exception:

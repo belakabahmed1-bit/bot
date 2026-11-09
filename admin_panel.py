@@ -36,6 +36,7 @@ direct_message_id = None
 # حالات الذاكرة المؤقتة لعمليات الإضافة المتعددة
 admin_state = {}
 admin_upload_cache = {}
+admin_video_state = {}
 
 
 # ===================== دوال الاستعلام والبيانات =====================
@@ -156,6 +157,7 @@ def admin_main_menu():
         InlineKeyboardButton("👁️ رؤية حلول الواجبات", callback_data="view_solutions_units")
     )
     markup.add(
+        InlineKeyboardButton("🎥 تسيير الفيديوهات الشارحة", callback_data="manage_videos_menu"),
         InlineKeyboardButton("📂 تسيير مواضيع BAC", callback_data="manage_bac_menu"),
         InlineKeyboardButton("📁 تسيير الملفات المتنوعة", callback_data="admin_open_folder_0")
     )
@@ -240,6 +242,37 @@ def setup_admin_panel_handlers(bot):
     def admin_collect_media(message):
         process_collect_media(message, bot)
 
+
+    # معالجة إدخال فيديو جديد
+    @bot.message_handler(
+        func=lambda m: m.from_user.id == ADMIN_ID and m.chat.id in admin_video_state and not (m.text or "").startswith("/")
+    )
+    def admin_video_input_handler(message):
+        chat_id = message.chat.id
+        st = admin_video_state.get(chat_id, {})
+        step = st.get("step")
+        text = (message.text or "").strip()
+
+        if step == "title":
+            st["title"] = text
+            st["step"] = "url"
+            bot.send_message(
+                chat_id,
+                f"✅ **تم تسجيل عنوان الفيديو:**\n`{text}`\n\n"
+                "🔗 أرسل الآن **رابط الفيديو على يوتيوب** (أو كود الـ Video ID):\n"
+                "✏️ (مثال: `https://youtu.be/9UrdZXS9Cy4`):",
+                parse_mode="Markdown"
+            )
+        elif step == "url":
+            st["url"] = text
+            st["step"] = "unit"
+            bot.send_message(
+                chat_id,
+                "📚 **اختر الوحدة التابع لها هذا الفيديو:**",
+                reply_markup=build_video_units_picker(),
+                parse_mode="Markdown"
+            )
+
     @bot.message_handler(func=lambda message: message.text == "🔙 العودة للوحة الأدمن" and message.from_user.id == ADMIN_ID)
     def exit_student_mode(message):
         db.admin_preview.discard(ADMIN_ID)
@@ -294,12 +327,20 @@ def handle_admin_callback(bot, call):
 
         elif data.startswith("ok_wait_"):
             uid = int(data.split("_")[-1])
-            if db.activate_from_wait(uid):
+            res = db.activate_from_wait(uid)
+            if res:
                 try:
                     from user_panel import main_menu
+                    phone_val = res.get("phone", "") if isinstance(res, dict) else ""
+                    code_val = res.get("code", "") if isinstance(res, dict) else ""
                     bot.send_message(
                         uid,
-                        "🎉 **تم تفعيل حسابك بنجاح من طرف الأستاذ!**\nمرحباً بك، يمكنك الآن تصفح الدروس وحل الواجبات ومتابعة تقييمك.",
+                        f"🎉 **تم قبولك وتفعيل حسابك بنجاح من طرف الأستاذ بلعقاب أسامة!** 🚀\n\n"
+                        f"مرحباً بك في عائلة الرياضيات لتحضير البكالوريا 🎓✨\n\n"
+                        f"🌐 **بيانات تسجيل دخولك لموقع الأستاذ الإلكتروني:**\n"
+                        f"📱 **رقم الهاتف:** `{phone_val}`\n"
+                        f"🔑 **الرمز السري:** `{code_val}`\n\n"
+                        f"⚠️ **تنبيه:** هذا الرمز السري دائم وخاص بك ولا يمكن تغييره. استعمله دائماً للدخول إلى موقع الأستاذ لمشاهدة الفيديوهات وتحميل التمارين والحلول 📐",
                         reply_markup=main_menu(uid),
                         parse_mode="Markdown"
                     )
@@ -743,6 +784,60 @@ def handle_admin_callback(bot, call):
             bot.register_next_step_handler(msg, process_save_note, bot, s_id, ex_id)
 
         # ----------------- 8. تسيير مواضيع البكالوريا -----------------
+        elif data == "manage_videos_menu":
+            text, markup = build_admin_videos_menu()
+            bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif data.startswith("toggle_vid_"):
+            vid_id = int(data.split("_")[-1])
+            new_val = db.toggle_video_active(vid_id)
+            ans = "🟢 تم تفعيل الفيديو للجميع في الموقع والبوت" if new_val == 1 else "🔴 تم إغلاق الفيديو عن الجميع"
+            bot.answer_callback_query(call.id, ans)
+            text, markup = build_admin_videos_menu()
+            bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif data.startswith("del_vid_"):
+            vid_id = int(data.split("_")[-1])
+            db.delete_video(vid_id)
+            bot.answer_callback_query(call.id, "تم حذف الفيديو بنجاح 🗑️")
+            text, markup = build_admin_videos_menu()
+            bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif data == "add_new_video_start":
+            admin_video_state[chat_id] = {"step": "title"}
+            bot.send_message(
+                chat_id,
+                "🎥 **إضافة فيديو تعليمي جديد:**\n\n"
+                "✏️ أرسل **عنوان الفيديو** (مثال: ملخص شامل لجميع حالات إشارة المشتقة):",
+                reply_markup=ReplyKeyboardRemove(),
+                parse_mode="Markdown"
+            )
+
+        elif data.startswith("vid_u_"):
+            u_id = int(data.split("_")[-1])
+            st = admin_video_state.pop(chat_id, None)
+            if not st or "title" not in st:
+                bot.answer_callback_query(call.id, "انتهت الجلسة، ابدأ من جديد.")
+            else:
+                unit_names = {
+                    1: "الدوال العددية 📉", 2: "الدلة الأسية 📈", 3: "الدلة اللوغارتمية 📊",
+                    4: "المتتاليات 🔢", 5: "الاحتمالات 🎲", 6: "القسمة في Z ➗",
+                    7: "الأعداد المركبة 🧮", 0: "شرح عام 🎬"
+                }
+                u_name = unit_names.get(u_id, "شرح عام 🎬")
+                db.add_video(st["title"], st.get("url", ""), u_id, u_name)
+                bot.send_message(
+                    chat_id,
+                    f"🎉 **تمت إضافة الفيديو بنجاح!**\n\n"
+                    f"🎬 **العنوان:** {st['title']}\n"
+                    f"📚 **الوحدة:** {u_name}\n"
+                    f"🟢 **الحالة:** مفعّل ومتاح للجميع في الموقع وبوت التليجرام 🚀",
+                    reply_markup=admin_reply_menu(),
+                    parse_mode="Markdown"
+                )
+                text, markup = build_admin_videos_menu()
+                bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+
         elif data == "manage_bac_menu":
             with db_lock:
                 cursor.execute("SELECT id, year, stream, title FROM bac_topics ORDER BY year DESC, id DESC")
@@ -1701,3 +1796,52 @@ def notify_all_students(bot, text):
             time.sleep(0.04)
 
     threading.Thread(target=_run, daemon=True).start()
+
+# ===================== دوال واجهات إدارة الفيديوهات =====================
+def build_admin_videos_menu():
+    videos = db.get_all_videos()
+    total = len(videos)
+    active_count = sum(1 for v in videos if v[5] == 1)
+
+    text = (
+        f"🎥 **إدارة الفيديوهات والشروحات الرسمية:**\n\n"
+        f"📊 **إجمالي الفيديوهات:** {total} | 🟢 **المفعلة:** {active_count} | 🔴 **المغلقة:** {total - active_count}\n\n"
+        f"💡 يمكنك إضافة فيديو جديد، تفعيله أو إغلاقه بضغطة واحدة، أو حذفه من المنصة والبوت:"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(InlineKeyboardButton("➕ إضافة فيديو جديد", callback_data="add_new_video_start"))
+
+    for v in videos:
+        vid_id, title, yt_id, unit_id, unit_name, is_act, created = v
+        status_icon = "🟢" if is_act == 1 else "🔴"
+        toggle_text = "🔒 إغلاق" if is_act == 1 else "🔓 تفعيل"
+        yt_link = f"https://youtu.be/{yt_id}" if yt_id else "https://youtube.com"
+
+        title_display = f"{status_icon} {title[:32]} ({unit_name})"
+        markup.add(InlineKeyboardButton(title_display, url=yt_link))
+        markup.add(
+            InlineKeyboardButton(f"🔄 {toggle_text}", callback_data=f"toggle_vid_{vid_id}"),
+            InlineKeyboardButton("🗑️ حذف", callback_data=f"del_vid_{vid_id}")
+        )
+
+    markup.add(InlineKeyboardButton("🔙 العودة للوحة الأدمن", callback_data="admin_home"))
+    return text, markup
+
+
+def build_video_units_picker():
+    markup = InlineKeyboardMarkup(row_width=2)
+    units = [
+        (1, "الدوال العددية 📉"),
+        (2, "الدلة الأسية 📈"),
+        (3, "الدلة اللوغارتمية 📊"),
+        (4, "المتتاليات 🔢"),
+        (5, "الاحتمالات 🎲"),
+        (6, "القسمة في Z ➗"),
+        (7, "الأعداد المركبة 🧮"),
+        (0, "شرح عام 🎬")
+    ]
+    for uid, uname in units:
+        markup.add(InlineKeyboardButton(uname, callback_data=f"vid_u_{uid}"))
+    markup.add(InlineKeyboardButton("🔙 إلغاء", callback_data="manage_videos_menu"))
+    return markup

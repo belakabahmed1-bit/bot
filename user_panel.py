@@ -47,10 +47,10 @@ def main_menu(user_id=None):
 
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(KeyboardButton("📘 الدروس"), KeyboardButton("📝 التمارين والحلول"))
-    markup.add(KeyboardButton(hw_label), KeyboardButton("📊 علامتي في الواجبات"))
-    markup.add(KeyboardButton("📂 مواضيع BAC"), KeyboardButton("📁 ملفات متنوعة"))
-    markup.add(KeyboardButton(chat_label), KeyboardButton("🤖 البوت الآلي لحل التمارين"))
-    markup.add(KeyboardButton("ℹ️ مساعدة"))
+    markup.add(KeyboardButton("🎥 الفيديوهات الشارحة"), KeyboardButton(hw_label))
+    markup.add(KeyboardButton("📊 علامتي في الواجبات"), KeyboardButton("📂 مواضيع BAC"))
+    markup.add(KeyboardButton("📁 ملفات متنوعة"), KeyboardButton(chat_label))
+    markup.add(KeyboardButton("🤖 البوت الآلي لحل التمارين"), KeyboardButton("ℹ️ مساعدة"))
     if user_id == ADMIN_ID and ADMIN_ID in db.admin_preview:
         markup.add(KeyboardButton("🔙 العودة للوحة الأدمن"))
     return markup
@@ -149,6 +149,37 @@ def register_user_handlers(bot):
         content_types=['text', 'photo', 'document', 'video', 'video_note', 'audio', 'voice'])
     def guard(message):
         bot.send_message(message.chat.id, "🔐 اكتب /start للتسجيل أولاً.")
+
+
+    # 🎥 الفيديوهات الشارحة الرسمية
+    @bot.message_handler(func=lambda message: message.text in ["🎥 الفيديوهات الشارحة", "🎥 الفيديوهات", "الفيديوهات"])
+    def show_videos_handler(message):
+        chat_id = message.chat.id
+        vids = db.get_active_videos()
+        if not vids:
+            bot.send_message(
+                chat_id,
+                "🎥 **الفيديوهات والشروحات الرسمية:**\n\n"
+                "لا توجد شروحات فيديو منشورة حالياً في هذه اللحظة، سيتم نشر فيديوهات جديدة قريباً من طرف الأستاذ أسامة! 🚀",
+                reply_markup=main_menu(message.from_user.id),
+                parse_mode="Markdown"
+            )
+            return
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        for v in vids[:20]:
+            vid_id, title, yt_id, unit_id, unit_name, is_act, created = v
+            yt_link = f"https://youtu.be/{yt_id}" if yt_id else "https://youtube.com"
+            btn_text = f"🎬 {title[:40]} ({unit_name})"
+            markup.add(InlineKeyboardButton(btn_text, url=yt_link))
+
+        bot.send_message(
+            chat_id,
+            "🎥 **شروحات وفيديوهات الأستاذ بلعقاب أسامة:**\n\n"
+            "اضغط على أي فيديو في القائمة أدناه لمشاهدته مباشرة على YouTube بجودة عالية 🔥👇",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
 
     # 1. البوت الآلي لحل التمارين
     @bot.message_handler(func=lambda message: message.text == "🤖 البوت الآلي لحل التمارين")

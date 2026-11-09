@@ -293,12 +293,24 @@ with db_lock:
         key TEXT PRIMARY KEY,
         value TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS videos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        youtube_id TEXT,
+        unit_id INTEGER DEFAULT 0,
+        unit_name TEXT DEFAULT 'عام',
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT
+    );
     """)
 
 # إضافة الأعمدة للجداول القديمة إن لم تكن موجودة
 _add_col("users", "joined_at", "TEXT")
+_add_col("users", "phone", "TEXT")
 _add_col("deleted_users", "joined_at", "TEXT")
 _add_col("wait", "created_at", "TEXT")
+_add_col("wait", "phone", "TEXT")
 _add_col("units", "unit_type", "TEXT DEFAULT 'general'")
 _add_col("exercises", "item_type", "TEXT DEFAULT 'exercise'")
 _add_col("exercises", "solution_file_id", "TEXT")
@@ -368,24 +380,53 @@ def get_user(user_id):
 
 def get_wait(user_id):
     with db_lock:
-        cursor.execute("SELECT user_id, full_name, school, code, created_at FROM wait WHERE user_id=?", (user_id,))
+        cursor.execute("SELECT user_id, full_name, school, code, created_at, phone FROM wait WHERE user_id=?", (user_id,))
         return cursor.fetchone()
 
 
 def activate_from_wait(user_id):
     with db_lock:
-        d = get_wait(user_id)  # (user_id, full_name, school, code, created_at)
+        d = get_wait(user_id)  # (user_id, full_name, school, code, created_at, phone)
         if not d:
-            return False
+            return None
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         joined = d[4] if (len(d) > 4 and d[4]) else now
-        cursor.execute("INSERT OR REPLACE INTO users (user_id, full_name, school, last_active, joined_at) VALUES (?,?,?,?,?)",
-                       (d[0], d[1], d[2], now, joined))
+        phone = d[5] if (len(d) > 5 and d[5]) else ""
+        code = d[3] if len(d) > 3 else ""
+
+        cursor.execute("INSERT OR REPLACE INTO users (user_id, full_name, school, last_active, joined_at, phone) VALUES (?,?,?,?,?,?)",
+                       (d[0], d[1], d[2], now, joined, phone))
         cursor.execute("DELETE FROM wait WHERE user_id=?", (user_id,))
+
+        # مزامنة التلميذ في جدول web_users للموقع أيضاً
+        if phone:
+            parts = (d[1] or "").split(maxsplit=1)
+            f_name = parts[0] if parts else ""
+            l_name = parts[1] if len(parts) > 1 else ""
+            import hashlib
+            pw_h = hashlib.sha256(code.encode()).hexdigest()
+            try:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
+                    VALUES (?, ?, ?, 'شعبة عامة', ?, ?, ?, 1, ?)
+                """, (f_name, l_name, phone, d[2], pw_h, code, now))
+            except Exception:
+                pass
+
+            try:
+                from web_server import turso_client
+                if turso_client:
+                    turso_client.execute("""
+                        INSERT OR REPLACE INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
+                        VALUES (?, ?, ?, 'شعبة عامة', ?, ?, ?, 1, ?)
+                    """, [f_name, l_name, phone, d[2], pw_h, code, now])
+            except Exception as e:
+                print("Turso sync web_user error:", e)
+
         conn.commit()
         user_steps.pop(user_id, None)
         attempts.pop(user_id, None)
-        return True
+        return {"phone": phone, "code": code, "full_name": d[1]}
 
 
 def track_activity(user_id):
@@ -560,3 +601,85 @@ def export_to_sqlite(path):
         finally:
             dest.close()
     return total
+
+
+# ===================== إدارة الفيديوهات والشروحات الرسمية =====================
+def extract_youtube_id(url):
+    if not url:
+        return ""
+    url = url.strip()
+    import re
+    match = re.search(r'(?:v=|\/embed\/|\/watch\?v=|youtu\.be\/|\/v\/)([0-9A-Za-z_-]{11})', url)
+    if match:
+        return match.group(1)
+    if len(url) == 11 and " " not in url and "/" not in url:
+        return url
+    return url
+
+
+def get_active_videos(unit_id=None):
+    with db_lock:
+        if unit_id and unit_id != "all":
+            cursor.execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos WHERE is_active = 1 AND unit_id = ? ORDER BY id DESC", (unit_id,))
+        else:
+            cursor.execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos WHERE is_active = 1 ORDER BY id DESC")
+        return cursor.fetchall()
+
+
+def get_all_videos():
+    with db_lock:
+        cursor.execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos ORDER BY id DESC")
+        return cursor.fetchall()
+
+
+def add_video(title, youtube_url, unit_id=0, unit_name="عام"):
+    yt_id = extract_youtube_id(youtube_url)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with db_lock:
+        cursor.execute(
+            "INSERT INTO videos (title, youtube_id, unit_id, unit_name, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+            (title, yt_id, unit_id, unit_name, now)
+        )
+        conn.commit()
+        vid_id = cursor.lastrowid
+
+    try:
+        from web_server import turso_client
+        if turso_client:
+            turso_client.execute(
+                "INSERT INTO videos (title, youtube_id, unit_id, unit_name, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+                [title, yt_id, unit_id, unit_name, now]
+            )
+    except Exception as e:
+        print("Turso sync add video error:", e)
+    return vid_id
+
+
+def toggle_video_active(video_id):
+    with db_lock:
+        cursor.execute("UPDATE videos SET is_active = (CASE WHEN is_active = 1 THEN 0 ELSE 1 END) WHERE id = ?", (video_id,))
+        conn.commit()
+        cursor.execute("SELECT is_active FROM videos WHERE id = ?", (video_id,))
+        row = cursor.fetchone()
+        new_val = row[0] if row else 1
+
+    try:
+        from web_server import turso_client
+        if turso_client:
+            turso_client.execute("UPDATE videos SET is_active = ? WHERE id = ?", [new_val, video_id])
+    except Exception as e:
+        print("Turso sync toggle video error:", e)
+    return new_val
+
+
+def delete_video(video_id):
+    with db_lock:
+        cursor.execute("DELETE FROM videos WHERE id = ?", (video_id,))
+        conn.commit()
+
+    try:
+        from web_server import turso_client
+        if turso_client:
+            turso_client.execute("DELETE FROM videos WHERE id = ?", [video_id])
+    except Exception as e:
+        print("Turso sync delete video error:", e)

@@ -136,16 +136,33 @@ def get_users_ranking():
 
 
 def delete_user_by_id(user_id):
-    str_id = str(user_id)
-    if str_id.startswith("W-"):
+    str_id = str(user_id).strip()
+    # 1. إذا كان تلميذ مسجل من الموقع (W-ID أو معرف رقمي)
+    if str_id.startswith("W-") or (str_id.isdigit() and len(str_id) <= 6):
         wid = str_id.replace("W-", "")
+        fn = "تلميذ الموقع"
         try:
             from web_server import turso_client
             if turso_client:
-                turso_client.execute("UPDATE web_users SET active = -1 WHERE id = ?", [wid])
+                w_info = turso_client.execute("SELECT id, first_name, last_name, phone, school FROM web_users WHERE id = ? OR phone = ?", [wid, str_id])
+                if w_info:
+                    r = w_info[0]
+                    wid = str(r[0])
+                    fn = f"{r[1]} {r[2]}".strip()
+                    ph = r[3]
+                    sch = r[4] or "الموقع الإلكتروني"
+                    now_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    turso_client.execute("UPDATE web_users SET active = -1 WHERE id = ?", [wid])
+                    with db_lock:
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO deleted_users (user_id, full_name, school, joined_at, last_active, deleted_at, phone, source) VALUES (?, ?, ?, ?, ?, ?, ?, 'web')",
+                            (int(wid) + 9990000, fn, sch, now_time, now_time, now_time, ph)
+                        )
+                        conn.commit()
+                    return user_id, fn
         except Exception as e:
             print("Delete web user error:", e)
-        return user_id, "تلميذ الموقع"
+        return user_id, fn
 
     with db_lock:
         cursor.execute("SELECT user_id, full_name, school, last_active, joined_at FROM users WHERE user_id=?", (user_id,))
@@ -184,6 +201,18 @@ def delete_user_by_id(user_id):
 
 
 def restore_user_by_id(user_id):
+    str_id = str(user_id).strip()
+    if str_id.startswith("W-") or (str_id.isdigit() and len(str_id) <= 6):
+        wid = str_id.replace("W-", "")
+        try:
+            from web_server import turso_client
+            if turso_client:
+                turso_client.execute("UPDATE web_users SET active = 1 WHERE id = ?", [wid])
+                return user_id, "تلميذ الموقع"
+        except Exception as e:
+            print("Restore web user error:", e)
+        return user_id, "تلميذ الموقع"
+
     with db_lock:
         cursor.execute("SELECT user_id, full_name, school, joined_at, last_active FROM deleted_users WHERE user_id=?", (user_id,))
         user_data = cursor.fetchone()
@@ -517,13 +546,15 @@ def handle_admin_callback(bot, call):
             bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
 
         elif data.startswith("del_user_"):
-            uid = int(data.split("_")[-1])
-            delete_user_by_id(uid)
-            bot.answer_callback_query(call.id, "تم حذف التلميذ ✅")
-            try:
-                bot.send_message(uid, "🚫 *تم حذف حسابك من قبل المشرف.*", reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
-            except Exception:
-                pass
+            raw_target = data.replace("del_user_", "").strip()
+            del_id, del_name = delete_user_by_id(raw_target)
+            bot.answer_callback_query(call.id, f"تم حذف {del_name or 'التلميذ'} وحظره بنجاح ✅")
+            if not str(raw_target).startswith("W-"):
+                try:
+                    uid = int(raw_target)
+                    bot.send_message(uid, "🚫 *تم حذف حسابك من قبل المشرف.*", reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
+                except Exception:
+                    pass
             rows = get_users_list()
             if not rows:
                 bot.edit_message_text("🚫 لا يوجد تلاميذ مفعلين.", chat_id=chat_id, message_id=msg_id, reply_markup=admin_main_menu(), parse_mode="Markdown")
@@ -541,9 +572,9 @@ def handle_admin_callback(bot, call):
             bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
 
         elif data.startswith("del_quick_") and not data == "del_quick_all":
-            uid = int(data.split("_")[-1])
-            delete_user_by_id(uid)
-            bot.answer_callback_query(call.id, "تم الحذف بنجاح ✅")
+            raw_target = data.replace("del_quick_", "").strip()
+            del_id, del_name = delete_user_by_id(raw_target)
+            bot.answer_callback_query(call.id, f"تم حذف {del_name or 'التلميذ'} بنجاح ✅")
             try:
                 bot.send_message(uid, "🚫 *تم حذف حسابك.*", reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
             except Exception:
@@ -1159,7 +1190,11 @@ def handle_admin_callback(bot, call):
             bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
 
         elif data.startswith("UD_"):
-            uid = int(data.split("_")[-1])
+            raw_uid = data.split("UD_")[-1]
+            if raw_uid.startswith("W-"):
+                bot.answer_callback_query(call.id, "📊 تلميذ مسجل من الموقع: نشاطه مسجل في المنصة الإلكترونية.", show_alert=True)
+                return
+            uid = int(raw_uid)
             name = get_user_full_name(uid)
             dates = get_user_activity_dates(uid)
             text, markup = build_user_days_list(uid, name, dates)
@@ -1214,7 +1249,22 @@ def handle_admin_callback(bot, call):
 
         # ----------------- 14. مراسلة بـ ID وبث عام مع رسائل تأكيد -----------------
         elif data.startswith("msg_user_"):
-            uid = int(data.split("_")[-1])
+            raw_uid = data.split("msg_user_")[-1]
+            if raw_uid.startswith("W-"):
+                wid = raw_uid.replace("W-", "")
+                st_info = ""
+                try:
+                    from web_server import turso_client
+                    if turso_client:
+                        w_r = turso_client.execute("SELECT first_name, last_name, phone FROM web_users WHERE id = ?", [wid])
+                        if w_r:
+                            st_info = f"👤 {w_r[0][0]} {w_r[0][1]}\n📱 الهاتف: {w_r[0][2]}"
+                except Exception:
+                    pass
+                alert_text = f"🌐 تلميذ مسجل عبر الموقع الإلكتروني:\n{st_info}\n\nتواصل معه عبر هاتفه أو إنستغرام." if st_info else "🌐 هذا التلميذ مسجل عبر الموقع الإلكتروني."
+                bot.answer_callback_query(call.id, alert_text, show_alert=True)
+                return
+            uid = int(raw_uid)
             target_user_id = uid
             name = get_user_full_name(uid)
             bot.answer_callback_query(call.id)
@@ -1498,6 +1548,22 @@ def process_manual_delete(message, bot):
         else:
             bot.send_message(chat_id, "❌ لم يتم العثور على أي تلميذ بهذه الـ IDs.", reply_markup=admin_main_menu())
         return
+
+    # فحص وحذف تلاميذ الموقع أيضاً
+    try:
+        from web_server import turso_client
+        if turso_client:
+            web_matches = turso_client.execute("""
+                SELECT id, first_name, last_name, phone FROM web_users
+                WHERE (first_name || ' ' || last_name) LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR phone = ? OR id = ?
+            """, [f"%{query}%", f"%{query}%", f"%{query}%", query, query.replace("W-", "")])
+            for wr in web_matches:
+                wid = wr[0]
+                wname = f"{wr[1]} {wr[2]}".strip()
+                delete_user_by_id(f"W-{wid}")
+                deleted_list.append((f"W-{wid}", f"{wname} (موقع)"))
+    except Exception as e_wm:
+        print("Manual delete web error:", e_wm)
 
     with db_lock:
         cursor.execute("SELECT user_id, full_name FROM users WHERE full_name LIKE ?", (f"%{query}%",))

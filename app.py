@@ -1,5 +1,13 @@
 """نقطة الانطلاق والتشغيل الرئيسية لبوت الرياضيات للأستاذ بلعقاب أسامة."""
 import os
+import time
+import traceback
+
+# توقيت الجزائر (خوادم Railway تعمل بتوقيت UTC). يجب ضبطه قبل أي استيراد آخر.
+os.environ["TZ"] = os.environ.get("BOT_TZ", "Africa/Algiers")
+if hasattr(time, "tzset"):
+    time.tzset()
+
 import re
 import secrets
 import string
@@ -15,7 +23,11 @@ from db import (
     get_user, get_wait, activate_from_wait, track_activity
 )
 from user_panel import main_menu, register_user_handlers
-from admin_panel import admin_main_menu, admin_reply_menu, handle_admin_callback, setup_admin_panel_handlers
+from admin_panel import (
+    admin_reply_menu, handle_admin_callback, setup_admin_panel_handlers,
+    send_admin_panel, reset_admin_state
+)
+from utils import install_update_dedup, install_safe_api
 
 
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -32,7 +44,20 @@ SCHOOLS = [
     "مدرسة ماسي الحلايمية"
 ]
 
-bot = telebot.TeleBot(TOKEN)
+
+
+class ErrorHandler(telebot.ExceptionHandler):
+    """خطأ داخل معالج واحد لا يجب أن يوقف البوت أو يعيد تشغيل الاستطلاع."""
+
+    def handle(self, exception):
+        print("Handler error:", repr(exception))
+        traceback.print_exception(type(exception), exception, exception.__traceback__)
+        return True
+
+
+bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=8, exception_handler=ErrorHandler())
+install_update_dedup(bot)   # تجاهل التحديث الواحد إذا وصل مرتين
+install_safe_api(bot)       # حماية الرسائل من أخطاء Markdown
 
 
 def is_admin(uid):
@@ -90,8 +115,9 @@ def start(message):
     # الأستاذ (الأدمن)
     if is_admin(uid):
         db.admin_preview.discard(uid)
+        reset_admin_state(message.chat.id)
         bot.send_message(message.chat.id, "أهلاً بك يا أستاذنا بلعقاب أسامة! يعطيك الصحة.. لوحة التحكم بين يديك 👑", reply_markup=admin_reply_menu())
-        bot.send_message(message.chat.id, "👑 **لوحة تحكم الأدمين:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, message.chat.id, "👑 **لوحة تحكم الأدمين:**")
         return
 
     # تلميذ مفعّل مسبقاً
@@ -269,4 +295,9 @@ if __name__ == "__main__":
         bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-    bot.infinity_polling()
+    bot.infinity_polling(
+        skip_pending=True,
+        timeout=30,
+        long_polling_timeout=30,
+        allowed_updates=["message", "callback_query"],
+    )

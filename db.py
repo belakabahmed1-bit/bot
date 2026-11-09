@@ -5,17 +5,169 @@ import os
 import json
 import threading
 from datetime import datetime
+import sqlite3
 import libsql_experimental as libsql
+from datetime import timedelta
 
 # الاتصال بقاعدة بيانات Turso السحابية عبر متغيرات البيئة
 URL = os.getenv("TURSO_DB_URL")
 TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
-conn = libsql.connect(database=URL, auth_token=TOKEN)
-cursor = conn.cursor()
+if not URL or not TOKEN:
+    raise RuntimeError("TURSO_DB_URL و TURSO_AUTH_TOKEN يجب إضافتهما في متغيرات البيئة")
 
 db_lock = threading.RLock()
 _activity_cache = set()
+
+_RETRY_HINTS = ("stream", "expired", "closed", "connection", "hrana", "timed out",
+                "timeout", "baton", "error sending request", "transport", "broken pipe")
+
+
+def _connect():
+    return libsql.connect(database=URL, auth_token=TOKEN)
+
+
+class _Holder:
+    """يحتفظ بالاتصال الحقيقي ويعيد فتحه تلقائياً إذا انقطع."""
+
+    def __init__(self):
+        self.raw = _connect()
+
+    def reconnect(self):
+        try:
+            self.raw = _connect()
+        except Exception as e:
+            print("DB reconnect failed:", e)
+
+
+_holder = _Holder()
+
+
+def _should_retry(exc):
+    msg = str(exc).lower()
+    return any(h in msg for h in _RETRY_HINTS)
+
+
+class _SafeCursor:
+    """مؤشر آمن للخيوط المتعددة: كل استعلام يُنفَّذ ويُقرأ كاملاً داخل القفل،
+    فلا يحدث خطأ Recursive use of cursors مهما تزامنت الطلبات."""
+
+    def __init__(self, holder):
+        self._h = holder
+        self._local = threading.local()
+
+    def _st(self):
+        l = self._local
+        if not hasattr(l, "rows"):
+            l.rows, l.pos = [], 0
+            l.rowcount, l.lastrowid, l.description = -1, None, None
+        return l
+
+    def _run(self, fn):
+        try:
+            return fn(self._h.raw)
+        except Exception as e:
+            if not _should_retry(e):
+                raise
+            self._h.reconnect()
+            return fn(self._h.raw)
+
+    def execute(self, sql, params=None):
+        st = self._st()
+
+        def go(raw):
+            cur = raw.cursor()
+            if params is None:
+                cur.execute(sql)
+            else:
+                cur.execute(sql, params)
+            try:
+                rows = cur.fetchall()
+            except Exception:
+                rows = []
+            return cur, rows
+
+        with db_lock:
+            cur, rows = self._run(go)
+            st.rows, st.pos = (list(rows) if rows else []), 0
+            st.rowcount = getattr(cur, "rowcount", -1)
+            st.lastrowid = getattr(cur, "lastrowid", None)
+            st.description = getattr(cur, "description", None)
+        return self
+
+    def executescript(self, script):
+        with db_lock:
+            self._run(lambda raw: raw.cursor().executescript(script))
+        return self
+
+    def fetchone(self):
+        st = self._st()
+        if st.pos < len(st.rows):
+            row = st.rows[st.pos]
+            st.pos += 1
+            return row
+        return None
+
+    def fetchall(self):
+        st = self._st()
+        rows = st.rows[st.pos:]
+        st.pos = len(st.rows)
+        return rows
+
+    def fetchmany(self, size=1):
+        st = self._st()
+        rows = st.rows[st.pos:st.pos + size]
+        st.pos += len(rows)
+        return rows
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+    @property
+    def rowcount(self):
+        return self._st().rowcount
+
+    @property
+    def lastrowid(self):
+        return self._st().lastrowid
+
+    @property
+    def description(self):
+        return self._st().description
+
+    def close(self):
+        pass
+
+
+class _SafeConn:
+    def __init__(self, holder):
+        self._h = holder
+
+    def cursor(self):
+        return _SafeCursor(self._h)
+
+    def commit(self):
+        with db_lock:
+            try:
+                self._h.raw.commit()
+            except Exception as e:
+                if not _should_retry(e):
+                    raise
+                self._h.reconnect()
+
+    def rollback(self):
+        with db_lock:
+            try:
+                self._h.raw.rollback()
+            except Exception:
+                pass
+
+    def __getattr__(self, name):
+        return getattr(self._h.raw, name)
+
+
+conn = _SafeConn(_holder)
+cursor = conn.cursor()
 
 user_steps, temp_data, attempts = {}, {}, {}
 
@@ -298,7 +450,8 @@ def cleanup_old_chat_messages():
     """حذف جميع الرسائل التي مضى عليها أكثر من 24 ساعة تلقائياً."""
     with db_lock:
         try:
-            cursor.execute("DELETE FROM chat_messages WHERE datetime(created_at) < datetime('now', '-24 hours')")
+            cutoff = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute("DELETE FROM chat_messages WHERE created_at < ?", (cutoff,))
             conn.commit()
         except Exception as e:
             print("Chat cleanup error:", e)
@@ -344,10 +497,7 @@ def apply_auto_zero_to_missing_students(exercise_id):
         all_students = cursor.fetchall()
 
         # التلاميذ الذين قدموا حلاً لهذا الواجب بالفعل
-        cursor.execute("""
-            SELECT DISTINCT student_id FROM submissions
-            WHERE exercise_name LIKE ? OR exercise_name LIKE ?
-        """, (f"%{clean_name}%", f"%{ex_name}%"))
+        cursor.execute("SELECT DISTINCT student_id FROM submissions WHERE exercise_name = ?", (ex_name,))
         submitted_ids = {r[0] for r in cursor.fetchall()}
 
         now_time = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -380,10 +530,33 @@ def remove_auto_zero_on_reopen(exercise_id):
         ex_name = ex_row[0]
         clean_name = ex_name.replace("حل", "").strip()
 
-        cursor.execute("""
-            DELETE FROM submissions
-            WHERE (exercise_name LIKE ? OR exercise_name LIKE ?) AND status = 'auto_zero' AND grade_text = '00/20'
-        """, (f"%{clean_name}%", f"%{ex_name}%"))
+        cursor.execute(
+            "DELETE FROM submissions WHERE exercise_name = ? AND status = 'auto_zero' AND grade_text = '00/20'",
+            (ex_name,)
+        )
         count_removed = cursor.rowcount
         conn.commit()
         return count_removed
+
+
+# ===================== نسخة احتياطية =====================
+def export_to_sqlite(path):
+    """ينسخ كل الجداول من Turso إلى ملف SQLite محلي ويرجع عدد الصفوف المنسوخة."""
+    total = 0
+    with db_lock:
+        cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL")
+        tables = cursor.fetchall()
+        dest = sqlite3.connect(path)
+        try:
+            for name, create_sql in tables:
+                dest.execute(create_sql)
+                cursor.execute(f'SELECT * FROM "{name}"')
+                rows = cursor.fetchall()
+                if rows:
+                    marks = ",".join("?" * len(rows[0]))
+                    dest.executemany(f'INSERT INTO "{name}" VALUES ({marks})', [tuple(r) for r in rows])
+                    total += len(rows)
+            dest.commit()
+        finally:
+            dest.close()
+    return total

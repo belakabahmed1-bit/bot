@@ -3,8 +3,8 @@ import re
 import os
 import time
 import json
-import sqlite3
 import tempfile
+import threading
 from datetime import datetime
 
 from telebot.types import (
@@ -15,6 +15,7 @@ from telebot.types import (
 
 import db
 from db import conn, cursor, get_setting, set_setting, db_lock
+from utils import first_in_album
 from admin_builders import (
     esc, _back,
     build_wait_list, build_users_list, build_schools_menu, build_school_users_list,
@@ -188,6 +189,39 @@ def admin_main_menu():
     return markup
 
 
+_panel_lock = threading.Lock()
+_last_panel = {}
+
+
+def send_admin_panel(bot, chat_id, text="👑 **لوحة التحكم:**"):
+    """يرسل لوحة الأدمن ويحذف النسخة السابقة منها حتى لا تتكدس اللوحات في المحادثة."""
+    with _panel_lock:
+        old = _last_panel.pop(chat_id, None)
+        if old:
+            try:
+                bot.delete_message(chat_id, old)
+            except Exception:
+                pass
+        msg = bot.send_message(chat_id, text, reply_markup=admin_main_menu(), parse_mode="Markdown")
+        _last_panel[chat_id] = msg.message_id
+        return msg
+
+
+def reset_admin_state(chat_id):
+    """يلغي أي عملية رفع أو إدخال معلّقة للأدمن (تُستعمل عند /start)."""
+    admin_upload_cache.pop(chat_id, None)
+    admin_state.pop(chat_id, None)
+    try:
+        bot_ref = _bot_ref.get("bot")
+        if bot_ref:
+            bot_ref.clear_step_handler_by_chat_id(chat_id)
+    except Exception:
+        pass
+
+
+_bot_ref = {}
+
+
 def admin_reply_menu():
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add(KeyboardButton("القائمة الرئيسية"))
@@ -195,15 +229,26 @@ def admin_reply_menu():
 
 
 def setup_admin_panel_handlers(bot):
+    _bot_ref["bot"] = bot
+
+    # استقبال ملفات الرفع (يدعم الألبومات دون ضياع أي ملف)
+    @bot.message_handler(
+        func=lambda m: m.from_user.id == ADMIN_ID
+        and m.chat.id in admin_upload_cache
+        and not (m.text or "").startswith("/"),
+        content_types=['text', 'photo', 'document', 'video', 'audio', 'voice', 'video_note'])
+    def admin_collect_media(message):
+        process_collect_media(message, bot)
+
     @bot.message_handler(func=lambda message: message.text == "🔙 العودة للوحة الأدمن" and message.from_user.id == ADMIN_ID)
     def exit_student_mode(message):
         db.admin_preview.discard(ADMIN_ID)
         bot.send_message(message.chat.id, "✅ عدت إلى وضع الأدمن.", reply_markup=admin_reply_menu())
-        bot.send_message(message.chat.id, "👑 **لوحة تحكم الأدمين:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, message.chat.id)
 
     @bot.message_handler(func=lambda message: message.text == "القائمة الرئيسية" and message.from_user.id == ADMIN_ID)
     def show_admin_panel(message):
-        bot.send_message(message.chat.id, "👑 **لوحة تحكم الأدمين:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, message.chat.id)
 
 
 # ===================== معالجة الأحداث والضغط على الأزرار (Callbacks) =====================
@@ -534,12 +579,15 @@ def handle_admin_callback(bot, call):
         elif data.startswith("del_hw_item_"):
             ex_id = int(data.split("_")[-1])
             with db_lock:
-                cursor.execute("SELECT unit_id FROM exercises WHERE id = ?", (ex_id,))
+                cursor.execute("SELECT unit_id, name FROM exercises WHERE id = ?", (ex_id,))
                 res = cursor.fetchone()
                 if res:
-                    u_id = res[0]
+                    u_id, hw_name = res[0], res[1]
                     cursor.execute("DELETE FROM exercises WHERE id = ?", (ex_id,))
-                    cursor.execute("DELETE FROM submissions WHERE exercise_name LIKE ?", (f"%{ex_id}%",))
+                    # احذف حلول هذا الواجب فقط، وليس حلول واجب آخر يحمل نفس الاسم
+                    cursor.execute("SELECT COUNT(*) FROM exercises WHERE name = ?", (hw_name,))
+                    if (cursor.fetchone() or [0])[0] == 0:
+                        cursor.execute("DELETE FROM submissions WHERE exercise_name = ?", (hw_name,))
                     conn.commit()
                     bot.answer_callback_query(call.id, "✅ تم حذف الواجب بنجاح!")
                     call.data = f"admin_hw_unit_{u_id}"
@@ -607,8 +655,8 @@ def handle_admin_callback(bot, call):
                     SELECT DISTINCT s.student_id, s.student_name, s.is_read, s.has_grade, s.grade_text, COALESCE(u.school, 'غير مسجل')
                     FROM submissions s
                     LEFT JOIN users u ON s.student_id = u.user_id
-                    WHERE s.exercise_name LIKE ? OR s.exercise_name LIKE ?
-                """, (f"%{clean_ex_name}%", f"%{ex_name}%"))
+                    WHERE s.exercise_name = ?
+                """, (ex_name,))
                 students = cursor.fetchall()
 
             markup = InlineKeyboardMarkup()
@@ -642,11 +690,11 @@ def handle_admin_callback(bot, call):
             clean_ex_name = ex_name.replace("حل", "").strip()
 
             with db_lock:
-                cursor.execute("UPDATE submissions SET is_read = 1 WHERE student_id = ? AND (exercise_name LIKE ? OR exercise_name LIKE ?)",
-                               (s_id, f"%{clean_ex_name}%", f"%{ex_name}%"))
+                cursor.execute("UPDATE submissions SET is_read = 1 WHERE student_id = ? AND exercise_name = ?",
+                               (s_id, ex_name))
                 conn.commit()
-                cursor.execute("SELECT photo_id, student_name, grade_text, notes_history FROM submissions WHERE student_id = ? AND (exercise_name LIKE ? OR exercise_name LIKE ?)",
-                               (s_id, f"%{clean_ex_name}%", f"%{ex_name}%"))
+                cursor.execute("SELECT photo_id, student_name, grade_text, notes_history FROM submissions WHERE student_id = ? AND exercise_name = ?",
+                               (s_id, ex_name))
                 subs = cursor.fetchall()
 
             if subs:
@@ -1028,18 +1076,13 @@ def handle_admin_callback(bot, call):
 def send_db_backup(bot, chat_id):
     """ينشئ نسخة آمنة من قاعدة البيانات ويرسلها للأدمن."""
     tmp_path = None
+    rows_count = 0
     try:
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         tmp_dir = tempfile.mkdtemp()
         tmp_path = os.path.join(tmp_dir, f"users_backup_{stamp}.db")
 
-        # نسخة متسقة حتى لو كان البوت يكتب أثناء النسخ
-        with db_lock:
-            dest = sqlite3.connect(tmp_path)
-            try:
-                conn.backup(dest)
-            finally:
-                dest.close()
+        rows_count = db.export_to_sqlite(tmp_path)
 
         size_kb = os.path.getsize(tmp_path) / 1024
         with open(tmp_path, "rb") as f:
@@ -1050,7 +1093,7 @@ def send_db_backup(bot, chat_id):
                 caption=(
                     f"💾 نسخة احتياطية من قاعدة البيانات\n"
                     f"🗓️ {stamp}\n"
-                    f"📦 الحجم: {size_kb:.1f} KB"
+                    f"📦 الحجم: {size_kb:.1f} KB | الصفوف: {rows_count}"
                 )
             )
     except Exception as e:
@@ -1070,9 +1113,9 @@ def send_db_backup(bot, chat_id):
 def process_add_hw_unit(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
-    unit_name = message.text.strip()
+    unit_name = (message.text or "").strip()
     if not unit_name:
         bot.send_message(chat_id, "❌ اسم الوحدة لا يمكن أن يكون فارغاً.", reply_markup=admin_reply_menu())
         return
@@ -1083,17 +1126,21 @@ def process_add_hw_unit(message, bot):
             bot.send_message(chat_id, f"✅ **تم إضافة الوحدة:** *{esc(unit_name)}* بنجاح!", reply_markup=admin_reply_menu(), parse_mode="Markdown")
         except Exception:
             bot.send_message(chat_id, "⚠️ هذه الوحدة موجودة مسبقاً أو حدث خطأ.", reply_markup=admin_reply_menu())
-    bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+    send_admin_panel(bot, chat_id)
 
 
 # 1. إضافة المحتوى (درس أو تمرين أو واجب) مع دعم إرسال عدة صور أو عدة ملفات
 def process_start_multi_upload(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
 
-    title = message.text.strip()
+    title = (message.text or "").strip()
+    if not title:
+        retry = bot.send_message(chat_id, "❌ أرسل العنوان كنص من فضلك:", reply_markup=admin_reply_menu())
+        bot.register_next_step_handler(retry, process_start_multi_upload, bot)
+        return
     st = admin_state.get(chat_id, {})
     kind = st.get("item_kind", "lesson")
     u_id = st.get("unit_id", 1)
@@ -1115,21 +1162,21 @@ def process_start_multi_upload(message, bot):
         reply_markup=markup,
         parse_mode="Markdown"
     )
-    bot.register_next_step_handler(msg, process_collect_media, bot)
 
 
 def process_collect_media(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
         admin_upload_cache.pop(chat_id, None)
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
 
     if message.text == "✅ تأكيد الإرسال والانتهاء":
-        cache = admin_upload_cache.pop(chat_id, None)
+        cache = admin_upload_cache.get(chat_id)
         if not cache or not cache["media"]:
             bot.send_message(chat_id, "⚠️ لم تقم برفع أي ملفات أو صور بعد! يرجى إرسال ملف أولاً.", reply_markup=admin_reply_menu())
             return
+        admin_upload_cache.pop(chat_id, None)
 
         title = cache["title"]
         kind = cache["kind"]
@@ -1150,37 +1197,49 @@ def process_collect_media(message, bot):
 
         kind_label = "الدرس" if kind == "lesson" else ("الواجب" if kind == "homework" else "التمرين")
         bot.send_message(chat_id, f"✅ **تم حفظ ونشر {kind_label} ({title}) بنجاح!** (عدد المرفقات: {len(media_list)})", reply_markup=admin_reply_menu(), parse_mode="Markdown")
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
 
         # إشعار للطلاب
         if kind == "homework" and get_setting("notify_homework", "1") == "1":
-            notify_all_students(bot, f"📝 **تنبيه واجب منزلي جديد!**\n\n• الوحدة: *{u_name}*\n• الواجب: *{title}*\n\n📤 يمكنك الاطلاع عليه وإرسال حلك عبر البوت.")
+            notify_all_students(bot, f"📝 **تنبيه واجب منزلي جديد!**\n\n• الوحدة: *{esc(u_name)}*\n• الواجب: *{esc(title)}*\n\n📤 يمكنك الاطلاع عليه وإرسال حلك عبر البوت.")
         elif kind != "homework" and get_setting("notify_lessons", "1") == "1":
             prefix = "📘 درس جديد" if kind == "lesson" else "📝 تمرين جديد"
-            notify_all_students(bot, f"{prefix}!\n\n• الوحدة: *{u_name}*\n• العنوان: *{title}*\n\n📚 متاح الآن للتحميل والمراجعة.")
+            notify_all_students(bot, f"{prefix}!\n\n• الوحدة: *{esc(u_name)}*\n• العنوان: *{esc(title)}*\n\n📚 متاح الآن للتحميل والمراجعة.")
         return
 
-    if chat_id not in admin_upload_cache:
+    cache = admin_upload_cache.get(chat_id)
+    if cache is None:
         bot.send_message(chat_id, "انتهت العملية، ابدأ من جديد.", reply_markup=admin_reply_menu())
         return
 
+    new_item = None
     if message.document:
-        admin_upload_cache[chat_id]["media"].append({"type": "document", "file_id": message.document.file_id})
+        new_item = {"type": "document", "file_id": message.document.file_id}
     elif message.photo:
-        admin_upload_cache[chat_id]["media"].append({"type": "photo", "file_id": message.photo[-1].file_id})
-    else:
-        bot.send_message(chat_id, "❌ يرجى إرسال ملف PDF أو صورة صالحة.")
+        new_item = {"type": "photo", "file_id": message.photo[-1].file_id}
 
-    cnt = len(admin_upload_cache[chat_id]["media"])
-    msg = bot.send_message(chat_id, f"📥 تم استلام المرفق رقم ({cnt}).\nأرسل ملفاً آخر أو اضغط **(✅ تأكيد الإرسال والانتهاء)**:")
-    bot.register_next_step_handler(msg, process_collect_media, bot)
+    if new_item is None:
+        bot.send_message(chat_id, "❌ يرجى إرسال ملف PDF أو صورة صالحة.")
+        return
+
+    if all(m["file_id"] != new_item["file_id"] for m in cache["media"]):
+        cache["media"].append(new_item)
+
+    # الألبوم يصل كرسائل منفصلة: نرد مرة واحدة فقط
+    if first_in_album(message):
+        bot.send_message(
+            chat_id,
+            f"📥 تم استلام المرفقات (العدد الحالي: {len(cache['media'])}).\n"
+            "أرسل المزيد أو اضغط **(✅ تأكيد الإرسال والانتهاء)**:",
+            parse_mode="Markdown"
+        )
 
 
 # 2. الحذف والاسترجاع بالـ ID
 def process_manual_delete(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
 
     query = (message.text or "").strip()
@@ -1229,7 +1288,7 @@ def process_manual_delete(message, bot):
 def process_manual_restore(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
 
     query = (message.text or "").strip()
@@ -1282,7 +1341,7 @@ def process_school_broadcast(message, bot, school_name):
     import time
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
     with db_lock:
         cursor.execute("SELECT user_id FROM users WHERE school LIKE ?", (f"{school_name}%",))
@@ -1310,7 +1369,7 @@ def process_school_broadcast(message, bot, school_name):
 def process_send_chat_reply(message, bot, student_id, student_name):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
     reply_text = (message.text or "").strip()
     now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1328,7 +1387,7 @@ def process_send_chat_reply(message, bot, student_id, student_name):
             )
             conn.commit()
         bot.send_message(chat_id, f"✅ تم إرسال ردك بنجاح إلى التلميذ ({student_name})!", reply_markup=admin_reply_menu())
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
     except Exception as e:
         bot.send_message(chat_id, f"❌ تعذر إرسال الرد:\n`{e}`", reply_markup=admin_reply_menu(), parse_mode="Markdown")
 
@@ -1337,9 +1396,9 @@ def process_send_chat_reply(message, bot, student_id, student_name):
 def process_save_grade(message, bot, student_id, ex_id):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
-    grade_val = message.text.strip()
+    grade_val = (message.text or "").strip()
     with db_lock:
         cursor.execute("SELECT name FROM exercises WHERE id = ?", (ex_id,))
         res = cursor.fetchone()
@@ -1354,8 +1413,8 @@ def process_save_grade(message, bot, student_id, ex_id):
     try:
         with db_lock:
             cursor.execute(
-                "UPDATE submissions SET has_grade = 1, grade_text = ? WHERE student_id = ? AND (exercise_name LIKE ? OR exercise_name LIKE ?)",
-                (grade_val, student_id, f"%{clean_ex_name}%", f"%{ex_name}%")
+                "UPDATE submissions SET has_grade = 1, grade_text = ? WHERE student_id = ? AND exercise_name = ?",
+                (grade_val, student_id, ex_name)
             )
             conn.commit()
 
@@ -1368,7 +1427,7 @@ def process_save_grade(message, bot, student_id, ex_id):
             parse_mode="Markdown"
         )
         bot.send_message(chat_id, f"✅ تم حفظ وإرسال العلامة ({grade_val}) بنجاح للتلميذ!", reply_markup=admin_reply_menu())
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
     except Exception as e:
         bot.send_message(chat_id, f"❌ خطأ: {e}", reply_markup=admin_reply_menu())
 
@@ -1376,9 +1435,9 @@ def process_save_grade(message, bot, student_id, ex_id):
 def process_save_note(message, bot, student_id, ex_id):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
-    new_note = message.text.strip()
+    new_note = (message.text or "").strip()
     now_time = datetime.now().strftime("%Y-%m-%d %H:%M")
     day_names = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
     day_name = day_names[datetime.now().weekday()]
@@ -1391,8 +1450,8 @@ def process_save_note(message, bot, student_id, ex_id):
     clean_ex_name = ex_name.replace("حل", "").strip()
 
     with db_lock:
-        cursor.execute("SELECT notes_history FROM submissions WHERE student_id = ? AND (exercise_name LIKE ? OR exercise_name LIKE ?)",
-                       (student_id, f"%{clean_ex_name}%", f"%{ex_name}%"))
+        cursor.execute("SELECT notes_history FROM submissions WHERE student_id = ? AND exercise_name = ?",
+                       (student_id, ex_name))
         row = cursor.fetchone()
     curr_notes = row[0] if (row and row[0]) else ""
     updated_notes = (curr_notes + f"\n• [{full_date}] الأستاذ: {new_note}").strip()
@@ -1400,8 +1459,8 @@ def process_save_note(message, bot, student_id, ex_id):
     try:
         with db_lock:
             cursor.execute(
-                "UPDATE submissions SET notes_history = ? WHERE student_id = ? AND (exercise_name LIKE ? OR exercise_name LIKE ?)",
-                (updated_notes, student_id, f"%{clean_ex_name}%", f"%{ex_name}%")
+                "UPDATE submissions SET notes_history = ? WHERE student_id = ? AND exercise_name = ?",
+                (updated_notes, student_id, ex_name)
             )
             conn.commit()
 
@@ -1413,7 +1472,7 @@ def process_save_note(message, bot, student_id, ex_id):
             parse_mode="Markdown"
         )
         bot.send_message(chat_id, "✅ تم تسجيل وإرسال الملاحظة بنجاح للتلميذ!", reply_markup=admin_reply_menu())
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
     except Exception as e:
         bot.send_message(chat_id, f"❌ خطأ: {e}", reply_markup=admin_reply_menu())
 
@@ -1422,9 +1481,9 @@ def process_save_note(message, bot, student_id, ex_id):
 def process_get_user_id_for_msg(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
-    input_id = message.text.strip()
+    input_id = (message.text or "").strip()
     if not input_id.isdigit():
         bot.send_message(chat_id, "❌ يرجى إدخال ID صحيح (أرقام فقط).")
         return
@@ -1438,7 +1497,7 @@ def process_get_user_id_for_msg(message, bot):
 def prepare_direct_message(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
     global direct_message_id
     direct_message_id = message.message_id
@@ -1462,7 +1521,7 @@ def prepare_direct_message(message, bot):
 def prepare_broadcast(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
     global broadcast_message_id
     broadcast_message_id = message.message_id
@@ -1516,9 +1575,9 @@ def start_broadcasting(bot, chat_id, target_msg_id):
 def process_add_bac_stream(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
-    stream = message.text.strip()
+    stream = (message.text or "").strip()
     admin_state[chat_id] = {"bac_stream": stream}
     msg = bot.send_message(chat_id, "🗓️ **أدخل سنة موضوع البكالوريا (مثال: 2024 أو 2023):**", reply_markup=admin_reply_menu())
     bot.register_next_step_handler(msg, process_add_bac_year, bot)
@@ -1527,13 +1586,14 @@ def process_add_bac_stream(message, bot):
 def process_add_bac_year(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
-    year_text = message.text.strip()
+    year_text = (message.text or "").strip()
     if not year_text.isdigit():
-        bot.send_message(chat_id, "❌ يرجى إدخال سنة صحيحة بالأرقام.")
+        retry = bot.send_message(chat_id, "❌ يرجى إدخال سنة صحيحة بالأرقام:", reply_markup=admin_reply_menu())
+        bot.register_next_step_handler(retry, process_add_bac_year, bot)
         return
-    admin_state[chat_id]["bac_year"] = int(year_text)
+    admin_state.setdefault(chat_id, {})["bac_year"] = int(year_text)
     msg = bot.send_message(chat_id, "📝 **أدخل عنوان الموضوع (مثال: بكالوريا 2024 - الدورة العادية + الحل):**", reply_markup=admin_reply_menu())
     bot.register_next_step_handler(msg, process_add_bac_title, bot)
 
@@ -1541,9 +1601,9 @@ def process_add_bac_year(message, bot):
 def process_add_bac_title(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
-    admin_state[chat_id]["bac_title"] = message.text.strip()
+    admin_state.setdefault(chat_id, {})["bac_title"] = (message.text or "").strip()
     msg = bot.send_message(chat_id, "📄 **أرسل الآن ملف PDF الخاص بموضوع البكالوريا:**", reply_markup=admin_reply_menu())
     bot.register_next_step_handler(msg, process_add_bac_file, bot)
 
@@ -1551,7 +1611,7 @@ def process_add_bac_title(message, bot):
 def process_add_bac_file(message, bot):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
     if not message.document:
         msg = bot.send_message(chat_id, "❌ يرجى إرسال ملف PDF صالح:")
@@ -1573,32 +1633,32 @@ def process_add_bac_file(message, bot):
         conn.commit()
 
     bot.send_message(chat_id, f"✅ تمت إضافة موضوع البكالوريا ({title}) بنجاح!", reply_markup=admin_reply_menu())
-    bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+    send_admin_panel(bot, chat_id)
 
     if get_setting("notify_bac", "1") == "1":
-        notify_all_students(bot, f"🎓 **تمت إضافة موضوع بكالوريا جديد:**\n\n• الشعبة: *{stream}*\n• السنة: *{year}*\n• الموضوع: *{title}*\n\n📂 يمكنك تحميله الآن من قسم مواضيع BAC.")
+        notify_all_students(bot, f"🎓 **تمت إضافة موضوع بكالوريا جديد:**\n\n• الشعبة: *{esc(stream)}*\n• السنة: *{year}*\n• الموضوع: *{esc(title)}*\n\n📂 يمكنك تحميله الآن من قسم مواضيع BAC.")
 
 
 # 8. إدارة الملفات المتنوعة
 def process_create_folder(message, bot, parent_id):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
-    folder_name = message.text.strip()
+    folder_name = (message.text or "").strip()
     with db_lock:
         cursor.execute("INSERT INTO file_folders (name, parent_id) VALUES (?, ?)", (folder_name, parent_id))
         conn.commit()
     bot.send_message(chat_id, f"✅ تم إنشاء المجلد ({folder_name}) بنجاح!", reply_markup=admin_reply_menu())
-    bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+    send_admin_panel(bot, chat_id)
 
 
 def process_upload_file_title(message, bot, folder_id):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
-    title = message.text.strip()
+    title = (message.text or "").strip()
     msg = bot.send_message(chat_id, "📄 **أرسل الآن ملف PDF أو الصورة:**", reply_markup=admin_reply_menu())
     bot.register_next_step_handler(msg, process_upload_file_data, bot, folder_id, title)
 
@@ -1606,7 +1666,7 @@ def process_upload_file_title(message, bot, folder_id):
 def process_upload_file_data(message, bot, folder_id, title):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":
-        bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+        send_admin_panel(bot, chat_id)
         return
 
     if message.document:
@@ -1625,14 +1685,19 @@ def process_upload_file_data(message, bot, folder_id, title):
                        (title, f_id, f_type, folder_id))
         conn.commit()
     bot.send_message(chat_id, f"✅ تم حفظ الملف ({title}) بنجاح!", reply_markup=admin_reply_menu())
-    bot.send_message(chat_id, "👑 **لوحة التحكم:**", reply_markup=admin_main_menu(), parse_mode="Markdown")
+    send_admin_panel(bot, chat_id)
 
 
 def notify_all_students(bot, text):
+    """يرسل الإشعار في خيط منفصل حتى لا يتجمد البوت أثناء الإرسال لعدد كبير من التلاميذ."""
     users = get_users_list()
-    for u in users:
-        try:
-            bot.send_message(u[0], text, parse_mode="Markdown")
+
+    def _run():
+        for u in users:
+            try:
+                bot.send_message(u[0], text, parse_mode="Markdown")
+            except Exception:
+                pass
             time.sleep(0.04)
-        except Exception:
-            pass
+
+    threading.Thread(target=_run, daemon=True).start()

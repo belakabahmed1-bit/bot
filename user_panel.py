@@ -1,6 +1,5 @@
 """لوحة تحكم التلميذ الكاملة للوصول إلى الدروس، التمارين، الواجبات، البكالوريا، والتواصل."""
 import os
-import sqlite3
 import json
 from datetime import datetime
 
@@ -12,12 +11,14 @@ from telebot.types import (
 
 import db
 from db import conn, cursor, get_user, user_steps, get_setting, db_lock
+from utils import send_media_bundle, parse_media, throttle, first_in_album
 
 ADMIN_ID = 5279737033
 
 # كاش مؤقت لإرسال حلول الواجبات
 student_temp_data = {}
 student_photos_cache = {}
+student_last_unit = {}  # آخر وحدة فتحها التلميذ (لتفادي تشابه أسماء التمارين بين الوحدات)
 
 
 def _md(s):
@@ -187,11 +188,12 @@ def register_user_handlers(bot):
             """, (chat_id, ADMIN_ID, ADMIN_ID, chat_id))
             messages = cursor.fetchall()
 
-        text = (
+        header = (
             "💬 **المحادثة المباشرة مع الأستاذ بلعقاب أسامة:**\n"
             "⚠️ *تُحذف الرسائل تلقائياً بعد مرور 24 ساعة من القراءة.*\n"
             "──────────────────────────────\n\n"
         )
+        text = ""
 
         if not messages:
             text += (
@@ -199,26 +201,34 @@ def register_user_handlers(bot):
                 "عندك سؤال ولا تمرين حاب تستفسر عليه؟ اضغط على الزر أدناه وابعث رسالتك للأستاذ أسامة 👇\n\n"
             )
         else:
+            blocks = []
             for m_id, s_id, s_name, msg_text, created_at in messages:
                 short_time = created_at.split()[-1][:5] if created_at else ""
+                body = _md(msg_text)
+                if len(body) > 700:
+                    body = body[:700] + "…"
                 if s_id == chat_id:
                     # رسالة التلميذ (المرسل: أنت ➔ إلى اليمين بفقاعة أنيقة)
-                    text += (
+                    blocks.append(
                         f"                                        👤 **أنت** 🕒 `{short_time}`\n"
                         f"                             ╭──────────────────\n"
-                        f"                             │ 💬 {_md(msg_text)}\n"
+                        f"                             │ 💬 {body}\n"
                         f"                             ╰──────────────────\n\n"
                     )
                 else:
                     # رسالة الأستاذ (الواردة: الأستاذ أسامة ➔ إلى اليسار)
-                    text += (
+                    blocks.append(
                         f"👑 **الأستاذ أسامة** 🕒 `{short_time}`\n"
                         f"╭──────────────────\n"
-                        f"│ 📩 _{_md(msg_text)}_\n"
+                        f"│ 📩 _{body}_\n"
                         f"╰──────────────────\n\n"
                     )
+            # حد تيليجرام 4096 حرفاً: نُبقي الرسائل الأحدث فقط
+            while len(blocks) > 1 and sum(len(b) for b in blocks) > 3200:
+                blocks.pop(0)
+            text += "".join(blocks)
 
-        text += "──────────────────────────────"
+        text = header + text + "──────────────────────────────"
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("✍️ إرسال رسالة جديدة للأستاذ أسامة", callback_data="student_send_new_msg"))
         markup.add(
@@ -313,9 +323,9 @@ def register_user_handlers(bot):
             bot.send_message(
                 ADMIN_ID,
                 f"💬 **استفسار جديد من التلميذ:**\n"
-                f"👤 *{student_name}* ({school})\n"
+                f"👤 *{_md(student_name)}* ({_md(school)})\n"
                 f"🆔 الآيدي: `{chat_id}`\n\n"
-                f"📝 *الرسالة:*\n{text_content}\n\n🕒 {now_time}",
+                f"📝 *الرسالة:*\n{_md(text_content)}\n\n🕒 {now_time}",
                 reply_markup=admin_markup,
                 parse_mode="Markdown"
             )
@@ -351,6 +361,7 @@ def register_user_handlers(bot):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("bac_st_"))
     def bac_stream_chosen(call):
+        bot.answer_callback_query(call.id)
         stream = call.data.replace("bac_st_", "")
         with db_lock:
             # ترتيب السنوات تصاعدياً من الأكبر إلى الأصغر (2025 -> 2008)
@@ -379,6 +390,7 @@ def register_user_handlers(bot):
 
     @bot.callback_query_handler(func=lambda call: call.data == "bac_back_streams")
     def bac_back_streams(call):
+        bot.answer_callback_query(call.id)
         markup = InlineKeyboardMarkup(row_width=2)
         streams = ["علوم تجريبية", "تقني رياضي", "رياضيات"]
         for st in streams:
@@ -393,6 +405,7 @@ def register_user_handlers(bot):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("bac_yr_"))
     def bac_year_chosen(call):
+        bot.answer_callback_query(call.id)
         parts = call.data.split("_")
         stream = parts[2]
         year = int(parts[3])
@@ -417,6 +430,9 @@ def register_user_handlers(bot):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("dl_bac_"))
     def bac_download_file(call):
         t_id = int(call.data.replace("dl_bac_", ""))
+        if not throttle(("bac", call.message.chat.id, t_id), 3):
+            bot.answer_callback_query(call.id)
+            return
         with db_lock:
             cursor.execute("SELECT title, pdf_file_id FROM bac_topics WHERE id = ?", (t_id,))
             row = cursor.fetchone()
@@ -425,7 +441,7 @@ def register_user_handlers(bot):
                 bot.send_document(
                     call.message.chat.id,
                     row[1],
-                    caption=f"📄 **{row[0]}**",
+                    caption=f"📄 **{_md(row[0])}**",
                     parse_mode="Markdown",
                     protect_content=True
                 )
@@ -475,6 +491,9 @@ def register_user_handlers(bot):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("stu_dl_file_"))
     def stu_dl_file_cb(call):
         fid = int(call.data.replace("stu_dl_file_", ""))
+        if not throttle(("file", call.message.chat.id, fid), 3):
+            bot.answer_callback_query(call.id)
+            return
         with db_lock:
             cursor.execute("SELECT title, file_id, file_type FROM custom_files WHERE id = ?", (fid,))
             row = cursor.fetchone()
@@ -482,9 +501,9 @@ def register_user_handlers(bot):
             title, file_id, f_type = row
             try:
                 if f_type == "photo":
-                    bot.send_photo(call.message.chat.id, file_id, caption=f"🖼️ **{title}**", parse_mode="Markdown", protect_content=True)
+                    bot.send_photo(call.message.chat.id, file_id, caption=f"🖼️ **{_md(title)}**", parse_mode="Markdown", protect_content=True)
                 else:
-                    bot.send_document(call.message.chat.id, file_id, caption=f"📄 **{title}**", parse_mode="Markdown", protect_content=True)
+                    bot.send_document(call.message.chat.id, file_id, caption=f"📄 **{_md(title)}**", parse_mode="Markdown", protect_content=True)
             except Exception as e:
                 bot.send_message(call.message.chat.id, f"❌ حدث خطأ أثناء إرسال الملف: {e}")
         bot.answer_callback_query(call.id)
@@ -562,7 +581,7 @@ def register_user_handlers(bot):
                 f"📝 **الواجب:** {_md(ex_name)}\n"
                 f"⭐ **العلامة:** `00/20`\n"
                 f"⚠️ **الحالة:** انتهت مهلة تسليم الواجب (تخلف عن التسليم).\n\n"
-                f"💬 **ملاحظات النظام والأستاذ:**\n{notes}\n"
+                f"💬 **ملاحظات النظام والأستاذ:**\n{_md(notes)}\n"
                 f"══════════════════════════════"
             )
             bot.send_message(chat_id, card, parse_mode="Markdown")
@@ -574,7 +593,7 @@ def register_user_handlers(bot):
             f"══════════════════════════════\n"
             f"📝 **الواجب:** {_md(ex_name)}\n"
             f"{grade_badge}\n\n"
-            f"💬 **ملاحظات وتوجيهات الأستاذ:**\n{notes}\n"
+            f"💬 **ملاحظات وتوجيهات الأستاذ:**\n{_md(notes)}\n"
             f"══════════════════════════════"
         )
 
@@ -585,8 +604,16 @@ def register_user_handlers(bot):
                 media_group.append(InputMediaPhoto(media=p_id, caption=cap, parse_mode="Markdown"))
             try:
                 bot.send_media_group(chat_id, media_group)
-            except Exception as e:
+            except Exception:
                 bot.send_message(chat_id, card, parse_mode="Markdown")
+                for p_id in photo_ids[:10]:
+                    try:
+                        bot.send_photo(chat_id, p_id, protect_content=True)
+                    except Exception:
+                        try:
+                            bot.send_document(chat_id, p_id, protect_content=True)
+                        except Exception:
+                            pass
         else:
             bot.send_message(chat_id, card, parse_mode="Markdown")
 
@@ -605,6 +632,9 @@ def register_user_handlers(bot):
     @bot.message_handler(func=lambda message: message.text and message.text.startswith("وجبات "))
     def handle_submit_unit_selection(message):
         text = message.text
+        hw_unit_id, _ = _find_unit_by_text(text.split("(")[0])
+        if hw_unit_id:
+            student_last_unit[message.chat.id] = hw_unit_id
         bot.send_message(
             message.chat.id,
             "📝 **اختر الواجب لعرض موضوعه وإرسال حلك:**",
@@ -619,33 +649,42 @@ def register_user_handlers(bot):
 
     @bot.message_handler(func=lambda message: message.text and message.text.startswith("حل "))
     def handle_chosen_exercise(message):
+        chat_id = message.chat.id
         ex_name = message.text[len("حل "):].strip()
+        if not throttle(("hw", chat_id, ex_name), 3):
+            return
+
+        u_id = student_last_unit.get(chat_id)
+        hw_row = None
         with db_lock:
-            cursor.execute("SELECT id, pdf_file_id, extra_media FROM exercises WHERE name = ? AND is_active = 1 AND item_type = 'homework'", (ex_name,))
-            hw_row = cursor.fetchone()
+            if u_id:
+                cursor.execute(
+                    "SELECT id, pdf_file_id, extra_media FROM exercises WHERE unit_id = ? AND name = ? AND is_active = 1 AND item_type = 'homework' ORDER BY id DESC",
+                    (u_id, ex_name))
+                hw_row = cursor.fetchone()
+            if not hw_row:
+                cursor.execute(
+                    "SELECT id, pdf_file_id, extra_media FROM exercises WHERE name = ? AND is_active = 1 AND item_type = 'homework' ORDER BY id DESC",
+                    (ex_name,))
+                hw_row = cursor.fetchone()
 
         if not hw_row:
-            bot.send_message(message.chat.id, "❌ هذا الواجب غير متاح لإرسال الحلول حالياً أو انتهت مهلته.")
+            bot.send_message(chat_id, "❌ هذا الواجب غير متاح لإرسال الحلول حالياً أو انتهت مهلته.")
             return
 
         hw_id, pdf_id, extra_json = hw_row
-        student_temp_data[message.chat.id] = ex_name
-        student_photos_cache[message.chat.id] = []
+        student_temp_data[chat_id] = ex_name
+        student_photos_cache[chat_id] = []
 
-        # إرسال موضوع الواجب أمام التلميذ فوراً
-        bot.send_message(message.chat.id, f"📝 **موضوع الواجب المنزلي ({_md(ex_name)}):**", parse_mode="Markdown")
-        if pdf_id:
-            try:
-                bot.send_document(message.chat.id, pdf_id, caption=f"📄 موضوع: {_md(ex_name)}", protect_content=True)
-            except Exception:
-                try:
-                    bot.send_photo(message.chat.id, pdf_id, caption=f"🖼️ موضوع: {_md(ex_name)}", protect_content=True)
-                except Exception:
-                    pass
+        # موضوع الواجب: كل الصور والملفات دفعة واحدة
+        items = parse_media(extra_json, pdf_id)
+        sent = send_media_bundle(bot, chat_id, f"📝 **موضوع الواجب المنزلي:** {_md(ex_name)}", items, protect=True)
+        if not sent:
+            bot.send_message(chat_id, "⚠️ تعذر إرسال ملفات الموضوع حالياً، أعد المحاولة بعد قليل.")
 
         bot.send_message(
-            message.chat.id,
-            f"📸 **موضوع الواجب أمامك أعلاه.**\n\n"
+            chat_id,
+            "📸 **موضوع الواجب أمامك أعلاه.**\n\n"
             "الآن بعد إنجاز الحل في كراستك، قم بتصوير صفحات الحل وأرسلها هنا (يمكنك إرسال عدة صور أو ملف PDF).\n"
             "⚠️ **ملاحظة:** يُمنع إرسال مقاطع الفيديو.\n\n"
             "عند الانتهاء تماماً، اضغط على زر **(✅ تأكيد الإرسال)** أسفل الشاشة:",
@@ -673,12 +712,18 @@ def register_user_handlers(bot):
         if chat_id not in student_photos_cache:
             student_photos_cache[chat_id] = []
 
-        student_photos_cache[chat_id].append(file_id)
-        count = len(student_photos_cache[chat_id])
+        if file_id not in student_photos_cache[chat_id]:
+            student_photos_cache[chat_id].append(file_id)
 
+        # عند إرسال عدة صور دفعة واحدة (ألبوم) نرد مرة واحدة فقط
+        if not first_in_album(message):
+            return
+        if message.media_group_id:
+            note = "📥 تم استلام صفحاتك ✅.\nأرسل المزيد أو اضغط على **✅ تأكيد الإرسال** لإنهاء الإرسال."
+        else:
+            note = f"📥 تم استلام الصفحة/المرفق رقم ({len(student_photos_cache[chat_id])}).\nأرسل صفحة أخرى أو اضغط على **✅ تأكيد الإرسال** لإنهاء الإرسال."
         bot.send_message(
-            chat_id,
-            f"📥 تم استلام الصفحة/المرفق رقم ({count}).\nأرسل صفحة أخرى أو اضغط على **✅ تأكيد الإرسال** لإنهاء الإرسال.",
+            chat_id, note,
             parse_mode="Markdown",
             reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("✅ تأكيد الإرسال"), KeyboardButton("⬅️ رجوع"))
         )
@@ -768,6 +813,7 @@ def register_user_handlers(bot):
         if not u_id:
             bot.send_message(message.chat.id, "❌ عذراً، هذا المحور غير متاح حالياً أو مغلق.")
             return
+        student_last_unit[message.chat.id] = u_id
 
         with db_lock:
             cursor.execute("SELECT id, name FROM exercises WHERE unit_id = ? AND is_active = 1 AND item_type = 'lesson' ORDER BY id ASC", (u_id,))
@@ -797,6 +843,7 @@ def register_user_handlers(bot):
         if not u_id:
             bot.send_message(message.chat.id, "❌ عذراً، هذا المحور غير متاح حالياً أو مغلق.")
             return
+        student_last_unit[message.chat.id] = u_id
 
         with db_lock:
             cursor.execute("SELECT id, name FROM exercises WHERE unit_id = ? AND is_active = 1 AND item_type = 'exercise' ORDER BY id ASC", (u_id,))
@@ -826,71 +873,57 @@ def register_user_handlers(bot):
 
     @bot.message_handler(func=lambda message: message.text and (message.text.startswith("📘") or message.text.startswith("📝")))
     def send_lesson_or_exercise_pdf(message):
+        chat_id = message.chat.id
         text = message.text
         if text in ("📘 الدروس", "📝 التمارين والحلول"):
             return
 
-        # استخراج العنوان النقي
-        clean_title = text
-        for pfx in ("📘 درس: ", "📝 تمرين: ", "📘 درس ", "📝 تمرين ", "📘 ", "📝 "):
-            if clean_title.startswith(pfx):
-                clean_title = clean_title[len(pfx):].strip()
+        item_type = "lesson" if text.startswith("📘") else "exercise"
+
+        # أسماء مرشحة: الاسم كما هو على الزر، ثم بدون بادئة "درس/تمرين" (للتوافق مع الأسماء القديمة)
+        base = text.split(" ", 1)[1].strip() if " " in text else text[1:].strip()
+        candidates = [base]
+        for pfx in ("درس: ", "تمرين: ", "درس ", "تمرين "):
+            if base.startswith(pfx) and base[len(pfx):].strip():
+                candidates.append(base[len(pfx):].strip())
                 break
 
+        # منع تكرار الإرسال عند النقر المزدوج
+        if not throttle(("content", chat_id, text), 3):
+            return
+
+        u_id = student_last_unit.get(chat_id)
+        row = None
         with db_lock:
-            cursor.execute("""
-                SELECT pdf_file_id, extra_media, name 
-                FROM exercises 
-                WHERE (name = ? OR name = ? OR name LIKE ?) AND is_active = 1
-            """, (clean_title, text, f"%{clean_title}%"))
-            row = cursor.fetchone()
+            for title in candidates:
+                if u_id:
+                    cursor.execute(
+                        "SELECT pdf_file_id, extra_media, name FROM exercises WHERE unit_id = ? AND item_type = ? AND name = ? AND is_active = 1 ORDER BY id DESC",
+                        (u_id, item_type, title))
+                    row = cursor.fetchone()
+                    if row:
+                        break
+                cursor.execute(
+                    "SELECT pdf_file_id, extra_media, name FROM exercises WHERE item_type = ? AND name = ? AND is_active = 1 ORDER BY id DESC",
+                    (item_type, title))
+                row = cursor.fetchone()
+                if row:
+                    break
 
-        if row:
-            pdf_id, extra_json, real_name = row
-            media_list = []
-            try:
-                if extra_json:
-                    media_list = json.loads(extra_json)
-            except Exception:
-                media_list = []
+        if not row:
+            bot.send_message(chat_id, "❌ عذراً، ملف هذا المحتوى غير متوفر حالياً.")
+            return
 
-            # إذا وُجدت مرفقات متعددة، تُرسل جميعها
-            if len(media_list) > 1:
-                photos = [m["file_id"] for m in media_list if m.get("type") == "photo"]
-                docs = [m["file_id"] for m in media_list if m.get("type") == "document"]
+        pdf_id, extra_json, real_name = row
+        items = parse_media(extra_json, pdf_id)
+        if not items:
+            bot.send_message(chat_id, "❌ عذراً، لا توجد ملفات مرفقة بهذا المحتوى بعد.")
+            return
 
-                if photos:
-                    for p_id in photos[:10]:
-                        try:
-                            bot.send_photo(message.chat.id, p_id, caption=f"📄 **{_md(real_name)}**", parse_mode="Markdown", protect_content=True)
-                        except Exception:
-                            pass
-
-                for doc_id in docs:
-                    try:
-                        bot.send_document(message.chat.id, doc_id, caption=f"📄 **{_md(real_name)}**", parse_mode="Markdown", protect_content=True)
-                    except Exception:
-                        pass
-            elif pdf_id:
-                try:
-                    bot.send_document(
-                        message.chat.id, pdf_id,
-                        caption=f"📄 **{_md(real_name)}**",
-                        parse_mode="Markdown",
-                        protect_content=True
-                    )
-                except Exception:
-                    try:
-                        bot.send_photo(
-                            message.chat.id, pdf_id,
-                            caption=f"🖼️ **{_md(real_name)}**",
-                            parse_mode="Markdown",
-                            protect_content=True
-                        )
-                    except Exception as e:
-                        bot.send_message(message.chat.id, f"❌ حدث خطأ أثناء إرسال الملف: {e}")
-        else:
-            bot.send_message(message.chat.id, "❌ عذراً، ملف هذا المحتوى غير متوفر حالياً.")
+        # كل الصور في ألبوم واحد وكل الملفات في ألبوم واحد
+        sent = send_media_bundle(bot, chat_id, f"📄 **{_md(real_name)}**", items, protect=True)
+        if not sent:
+            bot.send_message(chat_id, "❌ حدث خطأ أثناء إرسال الملفات، أعد المحاولة بعد قليل.")
 
     # 8. زر الرجوع والمساعدة
     @bot.message_handler(func=lambda message: message.text == "⬅️ رجوع")

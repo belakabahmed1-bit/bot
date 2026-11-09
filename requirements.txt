@@ -1,5 +1,2 @@
 pyTelegramBotAPI==4.18.0
 libsql-experimental
-flask==3.0.3
-requests
-gunicorn

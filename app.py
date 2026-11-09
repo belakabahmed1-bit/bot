@@ -122,6 +122,17 @@ def start(message):
         send_admin_panel(bot, message.chat.id, "👑 **لوحة تحكم الأدمين:**")
         return
 
+        # تلميذ مطرود / محذوف
+    with db.db_lock:
+        db.cursor.execute("SELECT user_id FROM deleted_users WHERE user_id=?", (uid,))
+        if db.cursor.fetchone():
+            bot.send_message(
+                message.chat.id,
+                "🚫 **تم إيقاف هذا الحساب وطردك من طرف الأستاذ بلعقاب أسامة.**\nلا يمكنك استخدام البوت أو المنصة.",
+                parse_mode="Markdown"
+            )
+            return
+
     # تلميذ مفعّل مسبقاً
     if get_user(uid):
         user_steps.pop(uid, None)

@@ -199,8 +199,7 @@ def register_user_handlers(bot):
         markup = InlineKeyboardMarkup(row_width=1)
         for v in vids[:20]:
             vid_id, title, yt_id, u_id, unit_name, is_act, created = v
-            yt_link = f"https://youtu.be/{yt_id}" if yt_id else "https://youtube.com"
-            markup.add(InlineKeyboardButton(f"▶️ {title[:38]}", url=yt_link))
+            markup.add(InlineKeyboardButton(f"▶️ {title[:38]}", callback_data=f"play_vid_{vid_id}"))
 
         markup.add(InlineKeyboardButton("🔙 العودة لقائمة الوحدات", callback_data="usr_vid_back_units"))
 
@@ -224,6 +223,30 @@ def register_user_handlers(bot):
             message_id=call.message.message_id,
             reply_markup=markup,
             parse_mode="Markdown"
+        )
+
+
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("play_vid_"))
+    def play_video_inline_chat(call):
+        v_id = int(call.data.replace("play_vid_", ""))
+        with db_lock:
+            cursor.execute("SELECT id, title, youtube_id, unit_name FROM videos WHERE id=?", (v_id,))
+            row = cursor.fetchone()
+        if not row:
+            bot.answer_callback_query(call.id, "الفيديو غير متوفر.")
+            return
+
+        bot.answer_callback_query(call.id, "جاري فتح المشغل الداخلي في المحادثة...")
+        yt_id = row[2]
+        bot.send_message(
+            call.message.chat.id,
+            f"🎬 **{row[1]}**\n"
+            f"📚 **الوحدة:** {row[3]}\n\n"
+            f"https://youtu.be/{yt_id}\n\n"
+            "👆 *المشغل المدمج جاهز: اضغط على زر التشغيل ▶️ أعلاه للمشاهدة فوراً داخل المحادثة دون مغادرة التليجرام.*",
+            disable_web_page_preview=False,
+            protect_content=True
         )
 
     # 1. البوت الآلي لحل التمارين

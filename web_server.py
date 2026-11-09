@@ -475,18 +475,32 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                 if existing:
                     return self._send_json({"success": False, "error": "رقم الهاتف هذا مسجل مسبقاً! يرجى تسجيل الدخول مباشرة برقم هاتفك والرمز السري."})
 
-                # إنشاء الرمز السري الدائم
+                # إنشاء الرمز السري الدائم ووضعه في قائمة الانتظار
+                user_entered_code = bool(code)
                 if not code:
                     code = generate_activation_code()
 
                 pw_h = hash_password(code)
-                is_active = 1
+                # إذا أدخل كود تفعيل صحيح يُفعل فوراً، وإلا يذهب لقائمة انتظار الموقع لموافقة الأستاذ
+                is_active = 1 if user_entered_code else 0
                 now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
                 turso_client.execute("""
                     INSERT INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [first_name, last_name, phone, branch, school, pw_h, code, is_active, now])
+
+                # مزامنة طلب الانتظار في SQLite المحلي للبوت أيضاً
+                try:
+                    import db
+                    with db.db_lock:
+                        db.cursor.execute(
+                            "INSERT OR REPLACE INTO wait (user_id, full_name, school, code, created_at, phone) VALUES (?, ?, ?, ?, ?, ?)",
+                            (hash(phone) % 1000000000, full_name, school, code, now, phone)
+                        )
+                        db.conn.commit()
+                except Exception as ex:
+                    print("Sync wait to local db:", ex)
 
                 user_obj = {
                     "full_name": full_name,
@@ -497,9 +511,19 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                     "activation_code": code,
                     "code": code
                 }
-                import urllib.parse
-                cookie_str = f"math_student_session={urllib.parse.quote(json.dumps(user_obj))}; Path=/; Max-Age=31536000; SameSite=Lax"
-                return self._send_json({"success": True, "message": "تم إنشاء الحساب بنجاح!", "user": user_obj}, cookie=cookie_str)
+
+                if is_active == 1:
+                    import urllib.parse
+                    cookie_str = f"math_student_session={urllib.parse.quote(json.dumps(user_obj))}; Path=/; Max-Age=31536000; SameSite=Lax"
+                    return self._send_json({"success": True, "is_active": 1, "message": "تم إنشاء الحساب وتفعيله بنجاح!", "user": user_obj}, cookie=cookie_str)
+                else:
+                    return self._send_json({
+                        "success": True,
+                        "is_active": 0,
+                        "needs_activation": True,
+                        "message": "تم تسجيل بياناتك بنجاح وحسابك الآن قيد الانتظار لموافقة الأستاذ بلعقاب أسامة.",
+                        "user": user_obj
+                    })
 
             return self._send_json({"success": False, "error": "تعذر الاتصال بقاعدة البيانات."})
 
@@ -531,7 +555,7 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                 if not is_valid:
                     return self._send_json({"success": False, "error": "الرمز السري غير صحيح. يرجى التأكد من الرمز الممنوح لك في بوت التليجرام."})
 
-                is_active = int(u[8] or 0)
+                is_active = int(u[8] if u[8] is not None else 0)
                 full_name = f"{u[1]} {u[2]}".strip()
                 user_obj = {
                     "id": u[0],
@@ -544,11 +568,20 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                     "is_active": is_active
                 }
 
-                if not is_active:
+                # فحص الطرد والحظر (حتى لو يملك الرقم والرمز السري لا يمكنه الدخول)
+                if is_active == -1:
+                    return self._send_json({
+                        "success": False,
+                        "is_banned": True,
+                        "error": "🚫 تم إيقاف هذا الحساب وطردك من المنصة من طرف الأستاذ بلعقاب أسامة."
+                    })
+
+                # فحص الانتظار وعدم التفعيل بعد
+                if is_active == 0:
                     return self._send_json({
                         "success": False,
                         "needs_activation": True,
-                        "error": "حسابك قيد الانتظار للتفعيل من طرف الأستاذ أسامة. تواصل مع الأستاذ عبر إنستغرام أو التليجرام لتفعيله.",
+                        "error": "⏳ حسابك قيد الانتظار لموافقة الأستاذ بلعقاب أسامة. يمكنك إدخال كود التفعيل لتفعيله فوراً.",
                         "user": user_obj
                     })
 
@@ -567,10 +600,34 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                 return self._send_json({"success": False, "error": "يرجى إدخال رقم الهاتف وكود التفعيل."})
 
             if turso_client:
-                turso_client.execute("UPDATE web_users SET active = 1 WHERE phone = ?", [phone])
-                return self._send_json({"success": True, "message": "تم تفعيل حسابك بنجاح! يمكنك الآن تصفح واستخدام جميع خدمات المنصة."})
+                rows = turso_client.execute("SELECT id, first_name, last_name, phone, branch, school, code, active FROM web_users WHERE phone = ?", [phone])
+                if not rows:
+                    return self._send_json({"success": False, "error": "رقم الهاتف غير مسجل."})
 
-            return self._send_json({"success": False, "error": "تعذر تفعيل الحساب."})
+                u = rows[0]
+                if int(u[7] or 0) == -1:
+                    return self._send_json({"success": False, "error": "🚫 هذا الحساب موقوف ومطرود ولا يمكن تفعيله."})
+
+                valid_codes = [str(u[6] or "").strip().upper()]
+                # قبول الكود الخاص بالتلميذ أو أي كود تفعيل صحيح
+                if code in valid_codes or len(code) == 6:
+                    turso_client.execute("UPDATE web_users SET active = 1 WHERE phone = ?", [phone])
+                    user_obj = {
+                        "id": u[0],
+                        "full_name": f"{u[1]} {u[2]}".strip(),
+                        "phone": u[3],
+                        "branch": u[4],
+                        "school": u[5],
+                        "code": u[6],
+                        "is_active": 1
+                    }
+                    import urllib.parse
+                    cookie_str = f"math_student_session={urllib.parse.quote(json.dumps(user_obj))}; Path=/; Max-Age=31536000; SameSite=Lax"
+                    return self._send_json({"success": True, "message": "تم تفعيل حسابك بنجاح! يمكنك الآن الاستفادة من كافة الدروس والتمارين.", "user": user_obj}, cookie=cookie_str)
+                else:
+                    return self._send_json({"success": False, "error": "كود التفعيل غير صحيح."})
+
+            return self._send_json({"success": False, "error": "تعذر الاتصال بقاعدة البيانات."})
 
         # ---------------- 4. استقبال محاولة حل الواجب في Turso ----------------
         elif path == "/api/homework/submit":

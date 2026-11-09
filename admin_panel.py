@@ -1,3 +1,12 @@
+
+def get_web_wait_list():
+    try:
+        from web_server import turso_client
+        if turso_client:
+            return turso_client.execute("SELECT id, first_name, last_name, phone, school, branch, code, created_at FROM web_users WHERE active = 0 ORDER BY id DESC")
+    except Exception as e:
+        print("get_web_wait_list error:", e)
+    return []
 """لوحة تحكم المشرف (الأستاذ) الكاملة لإدارة البوت والمحتوى والتلاميذ."""
 import re
 import os
@@ -103,6 +112,12 @@ def delete_user_by_id(user_id):
             cursor.execute("DELETE FROM user_activity WHERE user_id=?", (uid,))
             cursor.execute("DELETE FROM users WHERE user_id=?", (uid,))
             conn.commit()
+            try:
+                from web_server import turso_client
+                if turso_client and len(user_data) > 5 and user_data[5]:
+                    turso_client.execute("UPDATE web_users SET active = -1 WHERE phone = ?", [user_data[5]])
+            except Exception:
+                pass
             db.user_steps.pop(uid, None)
             return uid, full_name
 
@@ -144,9 +159,14 @@ def admin_main_menu():
     chat_badge = f" ({unread_chat} جديد)" if unread_chat > 0 else ""
 
     markup = InlineKeyboardMarkup(row_width=2)
+    web_wait_count = len(get_web_wait_list())
     markup.add(
-        InlineKeyboardButton(f"⏳ الانتظار ({wait_count})", callback_data="wait"),
-        InlineKeyboardButton(f"📊 المفعلين ({users_count})", callback_data="users")
+        InlineKeyboardButton(f"⏳ انتظار البوت ({wait_count})", callback_data="wait"),
+        InlineKeyboardButton(f"🌐 طلبات تسجيل الموقع ({web_wait_count})", callback_data="web_wait_menu")
+    )
+    markup.add(
+        InlineKeyboardButton(f"📊 المفعلين ({users_count})", callback_data="users"),
+        InlineKeyboardButton("⚙️ تسيير الوحدات والدروس", callback_data="manage_units_control")
     )
     markup.add(
         InlineKeyboardButton("📚 إدارة الواجبات المنزلية", callback_data="manage_units_menu"),

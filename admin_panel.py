@@ -1810,7 +1810,10 @@ def build_admin_videos_menu():
     )
 
     markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(InlineKeyboardButton("➕ إضافة فيديو جديد", callback_data="add_new_video_start"))
+    markup.add(
+        InlineKeyboardButton("➕ إضافة فيديو جديد", callback_data="add_new_video_start"),
+        InlineKeyboardButton("⚙️ تسيير وتفعيل الوحدات", callback_data="manage_units_control")
+    )
 
     for v in videos:
         vid_id, title, yt_id, unit_id, unit_name, is_act, created = v

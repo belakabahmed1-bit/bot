@@ -151,32 +151,77 @@ def register_user_handlers(bot):
         bot.send_message(message.chat.id, "🔐 اكتب /start للتسجيل أولاً.")
 
 
-    # 🎥 الفيديوهات الشارحة الرسمية
+    # 🎥 الفيديوهات الشارحة المنظمة داخل الوحدات (مع حظر إعادة التوجيه ولقطات الشاشة)
+    def _build_user_video_units_markup():
+        markup = InlineKeyboardMarkup(row_width=2)
+        with db_lock:
+            cursor.execute("""
+                SELECT u.id, u.name, COUNT(v.id)
+                FROM units u
+                LEFT JOIN videos v ON u.id = v.unit_id AND v.is_active = 1
+                WHERE u.is_active = 1
+                GROUP BY u.id
+                ORDER BY u.id ASC
+            """)
+            units_data = cursor.fetchall()
+
+        for u_id, u_name, v_cnt in units_data:
+            badge = f" ({v_cnt})" if v_cnt > 0 else ""
+            markup.add(InlineKeyboardButton(f"{u_name}{badge}", callback_data=f"usr_vid_u_{u_id}"))
+        markup.add(InlineKeyboardButton("🎬 كل الفيديوهات المفعلة", callback_data="usr_vid_u_all"))
+        return markup
+
     @bot.message_handler(func=lambda message: message.text in ["🎥 الفيديوهات الشارحة", "🎥 الفيديوهات", "الفيديوهات"])
     def show_videos_handler(message):
         chat_id = message.chat.id
-        vids = db.get_active_videos()
+        markup = _build_user_video_units_markup()
+        bot.send_message(
+            chat_id,
+            "🎥 **بنك الفيديوهات والشروحات الرسمية للأستاذ بلعقاب أسامة:**\n\n"
+            "📚 الفيديوهات منظمة ومقسمة حسب الوحدات المقررة.\n"
+            "اضغط على الوحدة التي تريد مشاهدة شروحاتها وفيديوهاتها 👇\n\n"
+            "🔒 *المحتوى محمي وخاص بالتلاميذ المسجلين.*",
+            reply_markup=markup,
+            parse_mode="Markdown",
+            protect_content=True
+        )
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("usr_vid_u_"))
+    def handle_user_vid_unit(call):
+        raw = call.data.replace("usr_vid_u_", "")
+        unit_id = None if raw == "all" else int(raw)
+        vids = db.get_active_videos(unit_id)
+
         if not vids:
-            bot.send_message(
-                chat_id,
-                "🎥 **الفيديوهات والشروحات الرسمية:**\n\n"
-                "لا توجد شروحات فيديو منشورة حالياً في هذه اللحظة، سيتم نشر فيديوهات جديدة قريباً من طرف الأستاذ أسامة! 🚀",
-                reply_markup=main_menu(message.from_user.id),
-                parse_mode="Markdown"
-            )
+            bot.answer_callback_query(call.id, "لا توجد فيديوهات منشورة في هذه الوحدة حالياً ⚠️")
             return
 
         markup = InlineKeyboardMarkup(row_width=1)
         for v in vids[:20]:
-            vid_id, title, yt_id, unit_id, unit_name, is_act, created = v
+            vid_id, title, yt_id, u_id, unit_name, is_act, created = v
             yt_link = f"https://youtu.be/{yt_id}" if yt_id else "https://youtube.com"
-            btn_text = f"🎬 {title[:40]} ({unit_name})"
-            markup.add(InlineKeyboardButton(btn_text, url=yt_link))
+            markup.add(InlineKeyboardButton(f"▶️ {title[:38]}", url=yt_link))
 
-        bot.send_message(
-            chat_id,
-            "🎥 **شروحات وفيديوهات الأستاذ بلعقاب أسامة:**\n\n"
-            "اضغط على أي فيديو في القائمة أدناه لمشاهدته مباشرة على YouTube بجودة عالية 🔥👇",
+        markup.add(InlineKeyboardButton("🔙 العودة لقائمة الوحدات", callback_data="usr_vid_back_units"))
+
+        unit_title = vids[0][4] if (unit_id and vids) else "جميع الوحدات"
+        bot.edit_message_text(
+            f"🎥 **فيديوهات: {unit_title}**\n\n"
+            "اضغط على أي فيديو لمشاهدته مباشرة داخل التليجرام بجودة عالية 🎬👇\n\n"
+            "⚠️ *ملاحظة:* تم تفعيل حماية المحتوى من لقطات الشاشة وإعادة التوجيه.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+
+    @bot.callback_query_handler(func=lambda call: call.data == "usr_vid_back_units")
+    def handle_user_vid_back(call):
+        markup = _build_user_video_units_markup()
+        bot.edit_message_text(
+            "🎥 **اختر الوحدة الدراسية لمشاهدة فيديوهاتها الشارحة:** 👇",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
             reply_markup=markup,
             parse_mode="Markdown"
         )

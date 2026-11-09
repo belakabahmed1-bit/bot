@@ -156,13 +156,15 @@ class PlatformHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=WEBSITE_DIR, **kwargs)
 
-    def _send_json(self, data, status=200):
+    def _send_json(self, data, status=200, cookie=None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -452,7 +454,7 @@ class PlatformHandler(SimpleHTTPRequestHandler):
         except Exception:
             pass
 
-        # ---------------- 🔑 1. إنشاء حساب جديد في Turso ----------------
+        # ---------------- 🔑 1. إنشاء حساب جديد في Turso متطابق مع البوت ----------------
         if path == "/api/auth/register":
             full_name = payload.get("full_name", "").strip()
             parts = full_name.split(maxsplit=1)
@@ -460,34 +462,26 @@ class PlatformHandler(SimpleHTTPRequestHandler):
             last_name = parts[1] if len(parts) > 1 else ""
 
             phone = payload.get("phone", "").strip()
-            password = payload.get("password", "").strip()
-            branch = payload.get("branch", "").strip()
-            school = payload.get("school", "").strip()
+            branch = payload.get("branch", "شعبة عامة").strip()
+            school = payload.get("school", "دراسة عن بعد 🌐").strip()
             code = payload.get("activation_code", "").strip().upper()
 
-            if not full_name or not phone or not password:
-                return self._send_json({"success": False, "error": "يرجى ملء جميع الحقول المطلوبة (الاسم، رقم الهاتف، وكلمة المرور)."})
-
-            if len(password) < 6:
-                return self._send_json({"success": False, "error": "كلمة المرور يجب أن تتكون من 6 أحرف أو أرقام على الأقل."})
+            if not full_name or not phone:
+                return self._send_json({"success": False, "error": "يرجى ملء جميع الحقول المطلوبة (الاسم الكامل ورقم الهاتف)."})
 
             if turso_client:
                 # التحقق من عدم تكرار الهاتف
                 existing = turso_client.execute("SELECT id FROM web_users WHERE phone = ?", [phone])
                 if existing:
-                    return self._send_json({"success": False, "error": "رقم الهاتف هذا مسجل مسبقاً! يرجى تسجيل الدخول مباشرة."})
+                    return self._send_json({"success": False, "error": "رقم الهاتف هذا مسجل مسبقاً! يرجى تسجيل الدخول مباشرة برقم هاتفك والرمز السري."})
 
-                # فحص كود التفعيل: إذا أدخل كوداً صحيحاً يُفعل حسابه فوراً
-                is_active = 0
-                now = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-                if code:
-                    # تفعيل فوري عند إدخال كود
-                    is_active = 1
-                else:
+                # إنشاء الرمز السري الدائم
+                if not code:
                     code = generate_activation_code()
 
-                pw_h = hash_password(password)
+                pw_h = hash_password(code)
+                is_active = 1
+                now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
                 turso_client.execute("""
                     INSERT INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
@@ -500,10 +494,12 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                     "branch": branch,
                     "school": school,
                     "is_active": is_active,
-                    "activation_code": code
+                    "activation_code": code,
+                    "code": code
                 }
-                msg = "تم إنشاء الحساب وتفعيله بنجاح!" if is_active else "تم إنشاء الحساب بنجاح وهو قيد الانتظار للتفعيل."
-                return self._send_json({"success": True, "message": msg, "user": user_obj})
+                import urllib.parse
+                cookie_str = f"math_student_session={urllib.parse.quote(json.dumps(user_obj))}; Path=/; Max-Age=31536000; SameSite=Lax"
+                return self._send_json({"success": True, "message": "تم إنشاء الحساب بنجاح!", "user": user_obj}, cookie=cookie_str)
 
             return self._send_json({"success": False, "error": "تعذر الاتصال بقاعدة البيانات."})
 
@@ -556,7 +552,9 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                         "user": user_obj
                     })
 
-                return self._send_json({"success": True, "message": "تم تسجيل الدخول بنجاح!", "user": user_obj})
+                import urllib.parse
+                cookie_str = f"math_student_session={urllib.parse.quote(json.dumps(user_obj))}; Path=/; Max-Age=31536000; SameSite=Lax"
+                return self._send_json({"success": True, "message": "تم تسجيل الدخول بنجاح!", "user": user_obj}, cookie=cookie_str)
 
             return self._send_json({"success": False, "error": "تعذر الاتصال بقاعدة البيانات."})
 

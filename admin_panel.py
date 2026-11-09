@@ -27,7 +27,7 @@ from db import conn, cursor, get_setting, set_setting, db_lock
 from utils import first_in_album
 from admin_builders import (
     esc, _back,
-    build_wait_list, build_users_list, build_schools_menu, build_school_users_list,
+    build_wait_list, build_web_wait_list, build_student_info_card, build_users_list, build_schools_menu, build_school_users_list,
     build_deleted_list, build_ranking_list, build_quick_delete_list, build_quick_restore_list,
     build_units_management, build_unit_content_management, build_homework_management,
     build_unit_homework_list, build_bac_admin_menu, build_files_folders_admin,
@@ -51,13 +51,13 @@ admin_video_state = {}
 # ===================== دوال الاستعلام والبيانات =====================
 def get_users_list():
     with db_lock:
-        cursor.execute("SELECT user_id, full_name, school, last_active, joined_at FROM users")
+        cursor.execute("SELECT user_id, full_name, school, last_active, joined_at, phone, code, source FROM users")
         return cursor.fetchall()
 
 
 def get_wait_list():
     with db_lock:
-        cursor.execute("SELECT user_id, full_name, school, code, created_at FROM wait")
+        cursor.execute("SELECT user_id, full_name, school, code, created_at, phone, source FROM wait WHERE source != 'web' OR source IS NULL")
         return cursor.fetchall()
 
 
@@ -161,12 +161,12 @@ def admin_main_menu():
     markup = InlineKeyboardMarkup(row_width=2)
     web_wait_count = len(get_web_wait_list())
     markup.add(
-        InlineKeyboardButton(f"⏳ انتظار البوت ({wait_count})", callback_data="wait"),
-        InlineKeyboardButton(f"🌐 طلبات تسجيل الموقع ({web_wait_count})", callback_data="web_wait_menu")
+        InlineKeyboardButton(f"⏳ قائمة انتظار البوت ({wait_count})", callback_data="wait"),
+        InlineKeyboardButton(f"🌐 قائمة انتظار الموقع ({web_wait_count})", callback_data="web_wait_menu")
     )
     markup.add(
         InlineKeyboardButton(f"📊 المفعلين ({users_count})", callback_data="users"),
-        InlineKeyboardButton("⚙️ تسيير الوحدات والدروس", callback_data="manage_units_control")
+        InlineKeyboardButton("🔑 كشف الرمز السري لتلميذ", callback_data="find_student_code")
     )
     markup.add(
         InlineKeyboardButton("📚 إدارة الواجبات المنزلية", callback_data="manage_units_menu"),
@@ -337,6 +337,64 @@ def handle_admin_callback(bot, call):
             send_db_backup(bot, chat_id)
 
         # ----------------- 1. قائمة الانتظار -----------------
+        
+        # ----------------- طلبات تسجيل الموقع والرمز السري -----------------
+        elif data == "web_wait_menu":
+            rows = get_web_wait_list()
+            text, markup = build_web_wait_list(rows)
+            bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif data.startswith("ok_web_wait_") or data.startswith("ok_web_phone_"):
+            target = data.split("_")[-1]
+            try:
+                from web_server import turso_client
+                if turso_client:
+                    if data.startswith("ok_web_phone_"):
+                        turso_client.execute("UPDATE web_users SET active = 1 WHERE phone = ?", [target])
+                    else:
+                        turso_client.execute("UPDATE web_users SET active = 1 WHERE id = ?", [target])
+            except Exception as e:
+                print("Accept web user error:", e)
+            bot.answer_callback_query(call.id, "✅ تم قبول وتفعيل تلميذ الموقع بنجاح!")
+            rows = get_web_wait_list()
+            text, markup = build_web_wait_list(rows)
+            try:
+                bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
+            except Exception:
+                pass
+
+        elif data.startswith("del_web_wait_") or data.startswith("del_web_phone_"):
+            target = data.split("_")[-1]
+            try:
+                from web_server import turso_client
+                if turso_client:
+                    if data.startswith("del_web_phone_"):
+                        turso_client.execute("UPDATE web_users SET active = -1 WHERE phone = ?", [target])
+                    else:
+                        turso_client.execute("UPDATE web_users SET active = -1 WHERE id = ?", [target])
+            except Exception as e:
+                print("Ban web user error:", e)
+            bot.answer_callback_query(call.id, "❌ تم حظر / رفض طلب الموقع!")
+            rows = get_web_wait_list()
+            text, markup = build_web_wait_list(rows)
+            try:
+                bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
+            except Exception:
+                pass
+
+        elif data == "find_student_code":
+            bot.edit_message_text(
+                "🔑 **كشف الرمز السري واستعلام بيانات التلميذ:**\n\n"
+                "أرسل الآن **رقم هاتف** التلميذ، أو **اسمه** (أو جزء منه)، أو **الآيدي** الخاص به للبحث فوراً:\n\n"
+                "💡 *ملاحظة:* سيبحث النظام في بيانات الموقع والتليجرام معاً ويعرض الرمز السري وحالة التفعيل.",
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 إلغاء والعودة", callback_data="admin_home")),
+                parse_mode="Markdown"
+            )
+            admin_state[chat_id] = "find_student_code"
+            bot.register_next_step_handler_by_chat_id(chat_id, process_find_student_code, bot)
+
         elif data == "wait":
             rows = get_wait_list()
             if not rows:
@@ -1829,10 +1887,9 @@ def build_admin_videos_menu():
         f"💡 يمكنك إضافة فيديو جديد، تفعيله أو إغلاقه بضغطة واحدة، أو حذفه من المنصة والبوت:"
     )
 
-    markup = InlineKeyboardMarkup(row_width=2)
+    markup = InlineKeyboardMarkup(row_width=1)
     markup.add(
-        InlineKeyboardButton("➕ إضافة فيديو جديد", callback_data="add_new_video_start"),
-        InlineKeyboardButton("⚙️ تسيير وتفعيل الوحدات", callback_data="manage_units_control")
+        InlineKeyboardButton("➕ إضافة فيديو جديد", callback_data="add_new_video_start")
     )
 
     for v in videos:
@@ -1868,3 +1925,127 @@ def build_video_units_picker():
         markup.add(InlineKeyboardButton(uname, callback_data=f"vid_u_{uid}"))
     markup.add(InlineKeyboardButton("🔙 إلغاء", callback_data="manage_videos_menu"))
     return markup
+
+def find_student_code_info(query):
+    """بحث شامل عن التلميذ ورمزه السري في قاعدة بيانات الموقع Turso وقاعدة البوت."""
+    query = str(query).strip()
+    results = []
+    # 1. البحث في الموقع (Turso)
+    try:
+        from web_server import turso_client
+        if turso_client:
+            web_rows = turso_client.execute("""
+                SELECT id, first_name, last_name, phone, school, branch, code, active, created_at
+                FROM web_users
+                WHERE phone LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR code = ?
+            """, [f"%{query}%", f"%{query}%", f"%{query}%", query.upper()])
+            for r in web_rows:
+                act = int(r[7] or 0)
+                status_str = "✅ مفعّل ونشط" if act == 1 else ("🚫 محظور / مطرود" if act == -1 else "⏳ قيد الانتظار")
+                results.append({
+                    "id": r[0],
+                    "name": f"{r[1]} {r[2]}".strip(),
+                    "phone": r[3],
+                    "school": r[4],
+                    "branch": r[5],
+                    "code": r[6],
+                    "status": status_str,
+                    "active": act,
+                    "created_at": r[8],
+                    "source_type": "web"
+                })
+    except Exception as e:
+        print("Search web_users error:", e)
+
+    # 2. البحث في البوت (SQLite / Users)
+    with db_lock:
+        try:
+            cursor.execute("""
+                SELECT user_id, full_name, school, last_active, joined_at, phone, code, source
+                FROM users
+                WHERE CAST(user_id AS TEXT) = ? OR full_name LIKE ? OR phone LIKE ? OR code = ?
+            """, (query, f"%{query}%", f"%{query}%", query.upper()))
+            for r in cursor.fetchall():
+                p = r[5] if len(r) > 5 else ""
+                c = r[6] if len(r) > 6 else ""
+                src = r[7] if len(r) > 7 and r[7] else "bot"
+                if p and any(res.get("phone") == p for res in results):
+                    continue
+                results.append({
+                    "id": r[0],
+                    "name": r[1],
+                    "phone": p or "غير مسجل",
+                    "school": r[2],
+                    "branch": "—",
+                    "code": c or "—",
+                    "status": "✅ مفعّل في البوت",
+                    "active": 1,
+                    "created_at": r[4],
+                    "source_type": src
+                })
+
+            cursor.execute("""
+                SELECT user_id, full_name, school, code, created_at, phone, source
+                FROM wait
+                WHERE CAST(user_id AS TEXT) = ? OR full_name LIKE ? OR phone LIKE ? OR code = ?
+            """, (query, f"%{query}%", f"%{query}%", query.upper()))
+            for r in cursor.fetchall():
+                p = r[5] if len(r) > 5 else ""
+                c = r[3] if len(r) > 3 else ""
+                src = r[6] if len(r) > 6 and r[6] else "bot"
+                if p and any(res.get("phone") == p for res in results):
+                    continue
+                results.append({
+                    "id": r[0],
+                    "name": r[1],
+                    "phone": p or "غير مسجل",
+                    "school": r[2],
+                    "branch": "—",
+                    "code": c or "—",
+                    "status": "⏳ انتظار تفعيل في البوت",
+                    "active": 0,
+                    "created_at": r[4],
+                    "source_type": src
+                })
+        except Exception as e:
+            print("Search local error:", e)
+
+    return results
+
+
+def process_find_student_code(message, bot):
+    """معالج إدخال الأستاذ للبحث عن الرمز السري."""
+    chat_id = message.chat.id
+    query = (message.text or "").strip()
+    if query in ["/start", "القائمة الرئيسية"]:
+        reset_admin_state(chat_id)
+        send_admin_panel(bot, chat_id)
+        return
+
+    results = find_student_code_info(query)
+    if not results:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🔍 محاولة بحث أخرى", callback_data="find_student_code"))
+        markup.add(InlineKeyboardButton("🔙 العودة للوحة التحكم", callback_data="admin_home"))
+        bot.send_message(
+            chat_id,
+            f"❌ لم يتم العثور على أي تلميذ يطابق: `{query}`\n\nتأكد من كتابة رقم الهاتف (10 أرقام) أو الاسم بشكل صحيح.",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        return
+
+    if len(results) == 1:
+        text, markup = build_student_info_card(results[0])
+        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        # أكثر من تلميذ يطابق البحث
+        markup = InlineKeyboardMarkup()
+        text = f"🔎 **تم العثور على {len(results)} نتائج مطابقة:**\n\n"
+        for st in results[:10]:
+            src_b = "🌐 موقع" if st["source_type"] == "web" else "🤖 بوت"
+            text += f"👤 *{esc(st['name'])}* | 📱 `{st['phone']}` | 🔑 `{st['code']}` | 🏷️ {src_b}\n"
+            text += f"الحالة: {st['status']}\n──────────────────\n"
+        markup.add(InlineKeyboardButton("🔍 بحث جديد", callback_data="find_student_code"))
+        markup.add(InlineKeyboardButton("🔙 العودة للوحة التحكم", callback_data="admin_home"))
+        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")

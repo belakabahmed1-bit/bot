@@ -40,6 +40,52 @@ def generate_activation_code():
     chars = string.ascii_uppercase + string.digits
     return ''.join(secrets.choice(chars) for _ in range(6))
 
+def notify_admin_website_registration(first_name, last_name, phone, school, branch, code, now, is_active):
+    """إرسال إشعار تلغرام فوري للأستاذ عند تسجيل تلميذ جديد من الموقع الإلكتروني."""
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        return
+    try:
+        import urllib.request
+        full_name = f"{first_name} {last_name}".strip()
+        status_text = "مفعّل تلقائياً بكود مسبق ✅" if is_active == 1 else "قيد الانتظار للمراجعة ⏳"
+        msg = (
+            f"🔔 **طلب تسجيل جديد!**\n\n"
+            f"🏷️ **المصدر:** 🌐 الموقع الإلكتروني\n"
+            f"👤 **الاسم واللقب:** {full_name}\n"
+            f"📱 **رقم الهاتف:** `{phone}`\n"
+            f"🔑 **الرمز السري:** `{code}`\n"
+            f"🏫 **المدرسة:** {school}\n"
+            f"📚 **الشعبة:** {branch}\n"
+            f"📊 **الحالة:** {status_text}\n"
+            f"🗓️ **تاريخ التسجيل:** {now}\n\n"
+            f"يمكنك القبول أو الحظر مباشرة من هنا:"
+        )
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": f"✅ قبول وتفعيل {full_name}", "callback_data": f"ok_web_phone_{phone}"},
+                    {"text": "❌ طرد / رفض", "callback_data": f"del_web_phone_{phone}"}
+                ]
+            ]
+        }
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": 5279737033,
+            "text": msg,
+            "parse_mode": "Markdown",
+            "reply_markup": reply_markup
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print("notify_admin_website_registration error:", e)
+
+
 # محاولة تحميل ملف .env
 def _load_dotenv():
     cur = os.path.dirname(os.path.abspath(__file__))
@@ -476,15 +522,14 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                     return self._send_json({"success": False, "error": "رقم الهاتف هذا مسجل مسبقاً! يرجى تسجيل الدخول مباشرة برقم هاتفك والرمز السري."})
 
                 # إنشاء الرمز السري الدائم ووضعه في قائمة الانتظار
-                user_entered_code = bool(code)
-                if not code:
-                    code = generate_activation_code()
-
+                # توليد الرمز السري الدائم للتلميذ ووضعه في قائمة انتظار الموقع
+                code = generate_activation_code()
                 pw_h = hash_password(code)
-                # إذا أدخل كود تفعيل صحيح يُفعل فوراً، وإلا يذهب لقائمة انتظار الموقع لموافقة الأستاذ
-                is_active = 1 if user_entered_code else 0
+                is_active = 0  # قيد الانتظار لموافقة الأستاذ بلعقاب أسامة
                 now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+                # إشعار تلغرام فوري للأستاذ
+                notify_admin_website_registration(first_name, last_name, phone, school, branch, code, now, is_active)
                 turso_client.execute("""
                     INSERT INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -495,7 +540,7 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                     import db
                     with db.db_lock:
                         db.cursor.execute(
-                            "INSERT OR REPLACE INTO wait (user_id, full_name, school, code, created_at, phone) VALUES (?, ?, ?, ?, ?, ?)",
+                            "INSERT OR REPLACE INTO wait (user_id, full_name, school, code, created_at, phone, source) VALUES (?, ?, ?, ?, ?, ?, 'web')",
                             (hash(phone) % 1000000000, full_name, school, code, now, phone)
                         )
                         db.conn.commit()

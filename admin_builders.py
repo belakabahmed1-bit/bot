@@ -21,38 +21,130 @@ def _back(markup, target="admin_home"):
 # ------------------- 1. قائمة الانتظار -------------------
 def build_wait_list(rows, prefix="del_wait"):
     markup = InlineKeyboardMarkup()
-    text = "⏳ **طلبات التسجيل في قائمة الانتظار:**\n\n"
-    for user_id, name, school, code, created_at in rows[:MAX_ROWS]:
+    text = f"🤖 **قائمة انتظار بوت التلغرام ({len(rows)} طلب معلّق):**\n\n"
+    if not rows:
+        return "🚫 لا توجد طلبات انتظار حالياً من بوت التلغرام.", _back(markup)
+    for r in rows[:MAX_ROWS]:
+        user_id = r[0]
+        name = r[1]
+        school = r[2]
+        c = r[3]
+        created_at = r[4]
+        phone = r[5] if len(r) > 5 and r[5] else "غير مسجل"
         text += (
             f"👤 *الاسم واللقب:* {esc(name)}\n"
+            f"📱 *رقم الهاتف:* `{phone}`\n"
+            f"🔑 *الرمز السري:* `{c}`\n"
+            f"🏷️ *المصدر:* 🤖 بوت التلغرام 📲\n"
             f"🏫 *المدرسة:* {esc(school)}\n"
             f"🆔 *الآيدي:* `{user_id}`\n"
-            f"🔐 *الكود:* `{code}`\n"
             f"🗓️ *تاريخ الطلب:* {created_at or '—'}\n"
             f"──────────────────\n"
         )
         markup.add(
             InlineKeyboardButton(f"✅ قبول {name}", callback_data=f"ok_wait_{user_id}"),
-            InlineKeyboardButton("❌ رفض", callback_data=f"{prefix}_{user_id}")
+            InlineKeyboardButton("❌ رفض وطرد", callback_data=f"{prefix}_{user_id}")
+        )
+    markup.add(InlineKeyboardButton("🌐 الانتقال لقائمة انتظار الموقع", callback_data="web_wait_menu"))
+    return text, _back(markup)
+
+
+def build_web_wait_list(rows):
+    markup = InlineKeyboardMarkup()
+    text = f"🌐 **قائمة انتظار الموقع الإلكتروني ({len(rows)} طلب معلّق):**\n\n"
+    if not rows:
+        return "🚫 لا توجد طلبات تسجيل معلقة من الموقع الإلكتروني حالياً.", _back(markup)
+    for r in rows[:MAX_ROWS]:
+        wid = r[0]
+        name = f"{r[1]} {r[2]}".strip()
+        phone = r[3]
+        school = r[4]
+        branch = r[5]
+        code = r[6]
+        created_at = r[7] if len(r) > 7 else "—"
+        text += (
+            f"👤 *الاسم واللقب:* {esc(name)}\n"
+            f"📱 *رقم الهاتف:* `{phone}`\n"
+            f"🔑 *الرمز السري:* `{code}`\n"
+            f"🏷️ *المصدر:* 🌐 الموقع الإلكتروني 💻\n"
+            f"🏫 *المدرسة:* {esc(school)}\n"
+            f"📚 *الشعبة:* {esc(branch)}\n"
+            f"🗓️ *تاريخ التسجيل:* {created_at or '—'}\n"
+            f"──────────────────\n"
+        )
+        markup.add(
+            InlineKeyboardButton(f"✅ تفعيل وقبول {name}", callback_data=f"ok_web_wait_{wid}"),
+            InlineKeyboardButton("❌ رفض وحظر", callback_data=f"del_web_wait_{wid}")
         )
     return text, _back(markup)
 
 
-# ------------------- 2. قائمة المفعلين -------------------
+# ------------------- 2. قائمة المفعلين مع الرمز السري -------------------
 def build_users_list(rows):
     markup = InlineKeyboardMarkup()
     text = f"📊 **قائمة التلاميذ المفعلين ({len(rows)} تلميذ):**\n\n"
-    for user_id, name, school, last_active, joined_at in rows[:MAX_ROWS]:
-        text += f"🆔 `{user_id}` | 👤 {esc(name)} | 🏫 {esc(school)}\n"
-        text += f"🕒 آخر ظهور: {last_active or '—'}\n\n"
+    if not rows:
+        return "🚫 لا يوجد تلاميذ مفعلين حالياً.", _back(markup)
+    for r in rows[:MAX_ROWS]:
+        user_id = r[0]
+        name = r[1]
+        school = r[2]
+        last_active = r[3]
+        joined_at = r[4]
+        phone = r[5] if len(r) > 5 and r[5] else "غير مسجل"
+        code = r[6] if len(r) > 6 and r[6] else "—"
+        source = r[7] if len(r) > 7 and r[7] else "bot"
+        src_label = "🤖 بوت" if source == "bot" else "🌐 موقع"
+
+        text += f"👤 *{esc(name)}* | 🏷️ {src_label}\n"
+        text += f"📱 الهاتف: `{phone}` | 🔑 الرمز السري: `{code}`\n"
+        text += f"🏫 {esc(school)} | 🆔 `{user_id}`\n"
+        text += f"🕒 آخر ظهور: {last_active or '—'}\n"
+        text += f"──────────────────\n"
         markup.add(
-            InlineKeyboardButton(f"📅 سجل نشاط {name}", callback_data=f"UD_{user_id}"),
+            InlineKeyboardButton(f"📅 النشاط", callback_data=f"UD_{user_id}"),
             InlineKeyboardButton(f"✉️ مراسلة", callback_data=f"msg_user_{user_id}"),
             InlineKeyboardButton("❌ حذف", callback_data=f"del_user_{user_id}")
         )
     if len(rows) > MAX_ROWS:
         text += f"… (يُعرض أول {MAX_ROWS} من {len(rows)})\n"
     return text, _back(markup)
+
+
+def build_student_info_card(student):
+    src_icon = "🌐 الموقع الإلكتروني" if student.get("source_type") == "web" else "🤖 بوت التلغرام"
+    text = (
+        f"📋 **بطاقة التلميذ والرمز السري:**\n\n"
+        f"👤 *الاسم واللقب:* {esc(student.get('name', ''))}\n"
+        f"📱 *رقم الهاتف:* `{student.get('phone', '—')}`\n"
+        f"🔑 *الرمز السري:* `{student.get('code', '—')}`\n"
+        f"🏷️ *المصدر:* {src_icon}\n"
+        f"🏫 *المدرسة:* {esc(student.get('school', '—'))}\n"
+        f"📚 *الشعبة:* {esc(student.get('branch', '—'))}\n"
+        f"📊 *حالة الحساب:* {student.get('status', '—')}\n"
+        f"🗓️ *تاريخ التسجيل:* {student.get('created_at', '—')}\n"
+    )
+    markup = InlineKeyboardMarkup()
+    st_id = student.get("id")
+    active = student.get("active", 0)
+    phone = student.get("phone", "")
+
+    if student.get("source_type") == "web":
+        if active == 0:
+            markup.add(InlineKeyboardButton("✅ قبول وتفعيل الحساب", callback_data=f"ok_web_wait_{st_id}"))
+        elif active == 1:
+            markup.add(InlineKeyboardButton("❌ حظر / طرد التلميذ", callback_data=f"del_web_wait_{st_id}"))
+        elif active == -1:
+            markup.add(InlineKeyboardButton("♻️ رفع الحظر وتفعيل", callback_data=f"ok_web_wait_{st_id}"))
+    else:
+        if active == 0:
+            markup.add(InlineKeyboardButton("✅ قبول وتفعيل في البوت", callback_data=f"ok_wait_{st_id}"))
+        elif active == 1:
+            markup.add(InlineKeyboardButton("❌ حذف التلميذ من البوت", callback_data=f"del_user_{st_id}"))
+
+    markup.add(InlineKeyboardButton("🔍 بحث عن تلميذ آخر", callback_data="find_student_code"))
+    markup.add(InlineKeyboardButton("🔙 العودة للوحة التحكم", callback_data="admin_home"))
+    return text, markup
 
 
 # ------------------- 3. تصنيف المدارس -------------------

@@ -6,7 +6,10 @@ import json
 import threading
 from datetime import datetime
 import sqlite3
-import libsql_experimental as libsql
+try:
+    import libsql_experimental as libsql
+except ImportError:
+    libsql = None
 from datetime import timedelta
 
 # الاتصال بقاعدة بيانات Turso السحابية عبر متغيرات البيئة
@@ -14,7 +17,8 @@ URL = os.getenv("TURSO_DB_URL")
 TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 if not URL or not TOKEN:
-    raise RuntimeError("TURSO_DB_URL و TURSO_AUTH_TOKEN يجب إضافتهما في متغيرات البيئة")
+    if libsql is not None:
+        print("Warning: TURSO_DB_URL or TURSO_AUTH_TOKEN missing in env.")
 
 db_lock = threading.RLock()
 _activity_cache = set()
@@ -24,7 +28,9 @@ _RETRY_HINTS = ("stream", "expired", "closed", "connection", "hrana", "timed out
 
 
 def _connect():
-    return libsql.connect(database=URL, auth_token=TOKEN)
+    if libsql is not None and URL and TOKEN:
+        return libsql.connect(database=URL, auth_token=TOKEN)
+    return sqlite3.connect("bot.db", check_same_thread=False)
 
 
 class _Holder:
@@ -311,6 +317,12 @@ _add_col("users", "phone", "TEXT")
 _add_col("deleted_users", "joined_at", "TEXT")
 _add_col("wait", "created_at", "TEXT")
 _add_col("wait", "phone", "TEXT")
+_add_col("wait", "source", "TEXT DEFAULT 'bot'")
+_add_col("users", "code", "TEXT")
+_add_col("users", "source", "TEXT DEFAULT 'bot'")
+_add_col("deleted_users", "phone", "TEXT")
+_add_col("deleted_users", "code", "TEXT")
+_add_col("deleted_users", "source", "TEXT DEFAULT 'bot'")
 _add_col("units", "unit_type", "TEXT DEFAULT 'general'")
 _add_col("exercises", "item_type", "TEXT DEFAULT 'exercise'")
 _add_col("exercises", "solution_file_id", "TEXT")
@@ -374,13 +386,13 @@ def set_setting(key, value):
 # ===================== إدارة المستخدمين =====================
 def get_user(user_id):
     with db_lock:
-        cursor.execute("SELECT user_id, full_name, school, last_active, joined_at FROM users WHERE user_id=?", (user_id,))
+        cursor.execute("SELECT user_id, full_name, school, last_active, joined_at, phone, code, source FROM users WHERE user_id=?", (user_id,))
         return cursor.fetchone()
 
 
 def get_wait(user_id):
     with db_lock:
-        cursor.execute("SELECT user_id, full_name, school, code, created_at, phone FROM wait WHERE user_id=?", (user_id,))
+        cursor.execute("SELECT user_id, full_name, school, code, created_at, phone, source FROM wait WHERE user_id=?", (user_id,))
         return cursor.fetchone()
 
 
@@ -394,8 +406,8 @@ def activate_from_wait(user_id):
         phone = d[5] if (len(d) > 5 and d[5]) else ""
         code = d[3] if len(d) > 3 else ""
 
-        cursor.execute("INSERT OR REPLACE INTO users (user_id, full_name, school, last_active, joined_at, phone) VALUES (?,?,?,?,?,?)",
-                       (d[0], d[1], d[2], now, joined, phone))
+        cursor.execute("INSERT OR REPLACE INTO users (user_id, full_name, school, last_active, joined_at, phone, code, source) VALUES (?,?,?,?,?,?,?,?)",
+                       (d[0], d[1], d[2], now, joined, phone, code, d[6] if len(d) > 6 and d[6] else "bot"))
         cursor.execute("DELETE FROM wait WHERE user_id=?", (user_id,))
 
         # مزامنة التلميذ في جدول web_users للموقع أيضاً

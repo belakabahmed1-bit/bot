@@ -265,10 +265,34 @@ def process_registration(message):
         now_time = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         cursor.execute(
-            "INSERT OR REPLACE INTO wait (user_id, full_name, school, code, created_at, phone) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO wait (user_id, full_name, school, code, created_at, phone, source) VALUES (?, ?, ?, ?, ?, ?, 'bot')",
             (uid, full_name, text, code, now_time, phone)
         )
         conn.commit()
+
+        # إشعار الأستاذ فوراً بطلب تسجيل جديد من بوت التلغرام
+        try:
+            markup_adm = InlineKeyboardMarkup()
+            markup_adm.add(
+                InlineKeyboardButton(f"✅ قبول {full_name}", callback_data=f"ok_wait_{uid}"),
+                InlineKeyboardButton("❌ رفض وطرد", callback_data=f"del_wait_{uid}")
+            )
+            bot.send_message(
+                ADMIN_ID,
+                f"🔔 **طلب تسجيل جديد!**\n\n"
+                f"🏷️ **المصدر:** 🤖 بوت التلغرام\n"
+                f"👤 **الاسم واللقب:** {full_name}\n"
+                f"📱 **رقم الهاتف:** `{phone}`\n"
+                f"🏫 **المدرسة:** {text}\n"
+                f"🔑 **الرمز السري:** `{code}`\n"
+                f"🆔 **الآيدي:** `{uid}`\n"
+                f"🗓️ **التاريخ:** {now_time}\n\n"
+                f"يمكنك القبول أو الرفض بضغطة زر أدناه:",
+                reply_markup=markup_adm,
+                parse_mode="Markdown"
+            )
+        except Exception as ex_adm:
+            print("Admin notify error:", ex_adm)
 
         user_steps[uid] = "activate"
 

@@ -40,6 +40,16 @@ def generate_activation_code():
     chars = string.ascii_uppercase + string.digits
     return ''.join(secrets.choice(chars) for _ in range(6))
 
+def normalize_phone(phone):
+    """Normalize Algerian phone: +213xxx -> 0xxx, 00213xxx -> 0xxx, strip spaces/dashes"""
+    import re
+    phone = re.sub(r'[\s\-\(\)]', '', phone)
+    if phone.startswith("+213"):
+        phone = "0" + phone[4:]
+    elif phone.startswith("00213"):
+        phone = "0" + phone[5:]
+    return phone
+
 def _do_telegram_notification(first_name, last_name, phone, school, branch, code, now, is_active):
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -565,6 +575,7 @@ class PlatformHandler(SimpleHTTPRequestHandler):
             last_name = parts[1] if len(parts) > 1 else ""
 
             phone = payload.get("phone", "").strip()
+            phone = normalize_phone(phone)
             branch = payload.get("branch", "شعبة عامة").strip()
             school = payload.get("school", "دراسة عن بعد 🌐").strip()
             code = payload.get("activation_code", "").strip().upper()
@@ -632,6 +643,7 @@ class PlatformHandler(SimpleHTTPRequestHandler):
         # ---------------- 🔑 2. تسجيل الدخول بالرقم والرمز السري من Turso ----------------
         elif path == "/api/auth/login":
             phone = payload.get("phone", "").strip()
+            phone = normalize_phone(phone)
             secret_input = (payload.get("password") or payload.get("code") or payload.get("secret_code") or "").strip()
 
             if not phone or not secret_input:
@@ -696,7 +708,11 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                 input_upper = secret_input.upper()
                 input_hash = hash_password(secret_input)
 
-                is_valid = (input_upper == code_db) or (input_hash == pw_hash_db) or (secret_input == pw_hash_db) or (hash_password(input_upper) == pw_hash_db)
+                # Accept: plain code match, salted hash, unsalted hash, uppercase salted hash
+                import hashlib as _hl
+                unsalted_hash = _hl.sha256(secret_input.encode()).hexdigest()
+                unsalted_hash_upper = _hl.sha256(input_upper.encode()).hexdigest()
+                is_valid = (input_upper == code_db) or (input_hash == pw_hash_db) or (unsalted_hash == pw_hash_db) or (unsalted_hash_upper == pw_hash_db) or (hash_password(input_upper) == pw_hash_db)
 
                 if not is_valid:
                     return self._send_json({"success": False, "error": "الرمز السري غير صحيح. يرجى التأكد من الرمز الممنوح لك في بوت التليجرام."})
@@ -733,6 +749,7 @@ class PlatformHandler(SimpleHTTPRequestHandler):
         # ---------------- 🔑 3. تفعيل الحساب بكود الأستاذ في Turso ----------------
         elif path == "/api/auth/activate":
             phone = payload.get("phone", "").strip()
+            phone = normalize_phone(phone)
             code = payload.get("activation_code", "").strip().upper()
 
             if not phone or not code:
@@ -784,6 +801,60 @@ class PlatformHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 print("Error saving submission to Turso:", e)
                 return self._send_json({"success": False, "error": str(e)}, status=500)
+
+        # ---------------- 💬 5. إرسال رسالة للأستاذ عبر الموقع ----------------
+        elif path == "/api/chat/send":
+            phone = payload.get("phone", "").strip()
+            message_text = payload.get("message", "").strip()
+            
+            if not phone or not message_text:
+                return self._send_json({"success": False, "error": "\u064a\u0631\u062c\u0649 \u0643\u062a\u0627\u0628\u0629 \u0631\u0633\u0627\u0644\u0629."})
+            
+            try:
+                import db
+                student_rows = turso_client.execute("SELECT id, first_name, last_name FROM web_users WHERE phone = ?", [phone]) if turso_client else []
+                if not student_rows:
+                    return self._send_json({"success": False, "error": "\u0644\u0645 \u064a\u062a\u0645 \u0627\u0644\u0639\u062b\u0648\u0631 \u0639\u0644\u0649 \u062d\u0633\u0627\u0628\u0643."})
+                
+                student_id = student_rows[0][0]
+                student_name = f"{student_rows[0][1]} {student_rows[0][2]}".strip()
+                now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                
+                with db.db_lock:
+                    db.cursor.execute("""
+                        INSERT INTO chat_messages (sender_id, sender_name, receiver_id, message_text, created_at, is_read)
+                        VALUES (?, ?, 5279737033, ?, ?, 0)
+                    """, (student_id, student_name, message_text, now))
+                    db.conn.commit()
+                
+                # Send Telegram notification to teacher
+                import threading
+                def _notify_teacher_chat():
+                    token = os.getenv("BOT_TOKEN")
+                    if not token:
+                        return
+                    try:
+                        import urllib.request
+                        msg = (
+                            f"\U0001f4ac **\u0631\u0633\u0627\u0644\u0629 \u062c\u062f\u064a\u062f\u0629 \u0645\u0646 \u0627\u0644\u0645\u0648\u0642\u0639!**\n\n"
+                            f"\U0001f464 **\u0627\u0644\u062a\u0644\u0645\u064a\u0630:** {student_name}\n"
+                            f"\U0001f4f1 **\u0627\u0644\u0647\u0627\u062a\u0641:** `{phone}`\n"
+                            f"\U0001f4dd **\u0627\u0644\u0631\u0633\u0627\u0644\u0629:**\n{message_text}\n\n"
+                            f"\u23f0 **\u0627\u0644\u0648\u0642\u062a:** {now}"
+                        )
+                        url_api = f"https://api.telegram.org/bot{token}/sendMessage"
+                        data_tg = json.dumps({"chat_id": 5279737033, "text": msg, "parse_mode": "Markdown"}).encode("utf-8")
+                        req = urllib.request.Request(url_api, data=data_tg, headers={"Content-Type": "application/json"})
+                        urllib.request.urlopen(req, timeout=10)
+                    except Exception as e:
+                        print("Chat telegram notify error:", e)
+                
+                threading.Thread(target=_notify_teacher_chat, daemon=True).start()
+                
+                return self._send_json({"success": True, "message": "\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0631\u0633\u0627\u0644\u062a\u0643 \u0644\u0644\u0623\u0633\u062a\u0627\u0630 \u0628\u0646\u062c\u0627\u062d!"})
+            except Exception as e:
+                print("Chat send error:", e)
+                return self._send_json({"success": False, "error": "\u062d\u062f\u062b \u062e\u0637\u0623 \u0623\u062b\u0646\u0627\u0621 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0631\u0633\u0627\u0644\u0629."})
 
         self.send_error(404, "Endpoint not found")
 

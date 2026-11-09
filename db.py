@@ -416,7 +416,8 @@ def activate_from_wait(user_id):
             f_name = parts[0] if parts else ""
             l_name = parts[1] if len(parts) > 1 else ""
             import hashlib
-            pw_h = hashlib.sha256(code.encode()).hexdigest()
+            salt = "prof_oussama_2027_"
+            pw_h = hashlib.sha256((salt + code).encode("utf-8")).hexdigest()
             try:
                 cursor.execute("""
                     INSERT OR REPLACE INTO web_users (first_name, last_name, phone, branch, school, pw_hash, code, active, created_at)

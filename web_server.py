@@ -200,6 +200,9 @@ class PlatformHandler(SimpleHTTPRequestHandler):
     """معالج طلبات الموقع وواجهات البرمجة المرتبطة بـ Turso."""
 
     def end_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
         self.send_header('Connection', 'close')
         super().end_headers()
 

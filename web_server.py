@@ -355,7 +355,7 @@ class PlatformHandler(SimpleHTTPRequestHandler):
 
                 messages = []
                 for r in rows:
-                    is_student = (r[1] == student_id)
+                    is_student = (str(r[1]) == str(student_id))
                     messages.append({
                         "id": r[0],
                         "sender": "student" if is_student else "teacher",
@@ -605,7 +605,43 @@ class PlatformHandler(SimpleHTTPRequestHandler):
         # ---------------- 9. API: تنزيل ملفات الـ PDF والصور من Turso مباشرة ----------------
         elif path.startswith("/api/media/"):
             file_id = path.split("/api/media/")[1].strip()
-            if turso_client and file_id and file_id != "#":
+            if not file_id or file_id == "#":
+                self.send_error(404, "Invalid file ID")
+                return
+
+            # 1. فحص مجلد التخزين المؤقت المحلي أولاً لسرعة فائقة (0ms)
+            cache_dir = os.path.join(CURRENT_DIR if os.path.basename(CURRENT_DIR) != "website" else PARENT_DIR, "media_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_file = os.path.join(cache_dir, f"{file_id}.bin")
+            cache_meta = os.path.join(cache_dir, f"{file_id}.meta")
+
+            if os.path.exists(cache_file) and os.path.exists(cache_meta):
+                try:
+                    with open(cache_meta, "r", encoding="utf-8") as fm:
+                        mime = fm.read().strip() or "application/pdf"
+                    with open(cache_file, "rb") as fb:
+                        raw_data = fb.read()
+                    ext = ".pdf"
+                    if "jpeg" in mime or "jpg" in mime:
+                        ext = ".jpg"
+                    elif "png" in mime:
+                        ext = ".png"
+                    elif "webp" in mime:
+                        ext = ".webp"
+
+                    self.send_response(200)
+                    self.send_header("Content-Type", mime)
+                    self.send_header("Content-Length", str(len(raw_data)))
+                    self.send_header("Content-Disposition", f"inline; filename={file_id}{ext}")
+                    self.send_header("Cache-Control", "public, max-age=86400")
+                    self.end_headers()
+                    self.wfile.write(raw_data)
+                    return
+                except Exception as ex_cache:
+                    print("Cache read error:", ex_cache)
+
+            # 2. الاستعلام من Turso Cloud
+            if turso_client:
                 try:
                     meta_rows = turso_client.execute("SELECT mime FROM media_files WHERE file_id=?", [file_id])
                     mime = meta_rows[0][0] if meta_rows else "application/pdf"
@@ -613,6 +649,63 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                     chunk_rows = turso_client.execute("SELECT data FROM media_chunks WHERE file_id=? ORDER BY seq ASC", [file_id])
                     if chunk_rows:
                         raw_data = b"".join(base64.b64decode(c[0]) for c in chunk_rows)
+                        try:
+                            with open(cache_file, "wb") as fb:
+                                fb.write(raw_data)
+                            with open(cache_meta, "w", encoding="utf-8") as fm:
+                                fm.write(mime)
+                        except Exception:
+                            pass
+
+                        ext = ".pdf"
+                        if "jpeg" in mime or "jpg" in mime:
+                            ext = ".jpg"
+                        elif "png" in mime:
+                            ext = ".png"
+                        elif "webp" in mime:
+                            ext = ".webp"
+
+                        self.send_response(200)
+                        self.send_header("Content-Type", mime)
+                        self.send_header("Content-Length", str(len(raw_data)))
+                        self.send_header("Content-Disposition", f"inline; filename={file_id}{ext}")
+                        self.send_header("Cache-Control", "public, max-age=86400")
+                        self.end_headers()
+                        self.wfile.write(raw_data)
+                        return
+                except Exception as e:
+                    print(f"Error serving media {file_id} from Turso:", e)
+
+            # 3. محاولة جلبه من تيليغرام مباشرة إذا توفر BOT_TOKEN
+            token = os.getenv("BOT_TOKEN")
+            if token:
+                try:
+                    import urllib.request
+                    url_info = f"https://api.telegram.org/bot{token}/getFile?file_id={file_id}"
+                    req = urllib.request.Request(url_info, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=8) as r:
+                        info_data = json.loads(r.read().decode())
+                    if info_data.get("ok"):
+                        file_path = info_data["result"]["file_path"]
+                        dl_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+                        req_dl = urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req_dl, timeout=15) as r_dl:
+                            raw_data = r_dl.read()
+                        
+                        mime = "application/pdf"
+                        if file_path.endswith(".jpg") or file_path.endswith(".jpeg"):
+                            mime = "image/jpeg"
+                        elif file_path.endswith(".png"):
+                            mime = "image/png"
+                        
+                        try:
+                            with open(cache_file, "wb") as fb:
+                                fb.write(raw_data)
+                            with open(cache_meta, "w", encoding="utf-8") as fm:
+                                fm.write(mime)
+                        except Exception:
+                            pass
+
                         self.send_response(200)
                         self.send_header("Content-Type", mime)
                         self.send_header("Content-Length", str(len(raw_data)))
@@ -620,8 +713,8 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                         self.end_headers()
                         self.wfile.write(raw_data)
                         return
-                except Exception as e:
-                    print(f"Error serving media {file_id} from Turso:", e)
+                except Exception as ex_tg:
+                    print("Telegram fallback error:", ex_tg)
 
             self.send_error(404, "File not found or not synced yet")
             return
@@ -969,51 +1062,147 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                 else:
                     return self._send_json({"success": False, "error": "كود التفعيل غير صحيح."})
 
-            return self._send_json({"success": False, "error": "تعذر الاتصال بقاعدة البيانات."})
-
-        # ---------------- 4. استقبال محاولة حل الواجب في Turso ----------------
+            return self._send_json({"success": False, "error": "تعذر الاتصال بقاعدة البيانات."})        # ---------------- 4. استقبال محاولة حل الواجب في Turso والمحلي ----------------
         elif path == "/api/homework/submit":
             try:
-                student_name = payload.get("student_name", "تلميذ من الموقع")
-                exercise_name = payload.get("exercise_name", "واجب منزلي")
+                student_name = (payload.get("student_name") or "تلميذ مسجل").strip()
+                exercise_name = (payload.get("exercise_name") or "واجب منزلي").strip()
+                school = (payload.get("school") or "دراسة عن بعد 🌐").strip()
+                phone = normalize_phone((payload.get("phone") or "").strip())
+                student_id = payload.get("student_id")
+                note = (payload.get("note") or "").strip()
+                now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+                import db
+                # استخراج معرف التلميذ
+                if not student_id and phone:
+                    if turso_client:
+                        s_rows = turso_client.execute("SELECT id FROM web_users WHERE phone = ?", [phone])
+                        if s_rows:
+                            student_id = s_rows[0][0]
+                    if not student_id:
+                        with db.db_lock:
+                            db.cursor.execute("SELECT user_id FROM users WHERE phone = ?", (phone,))
+                            r_u = db.cursor.fetchone()
+                            if r_u:
+                                student_id = r_u[0]
+                if not student_id:
+                    student_id = abs(hash(phone or student_name)) % 1000000000
+
+                # 1. الحفظ في قاعدة بيانات SQLite المحلية ليظهر للأستاذ في لوحة تحكم البوت
+                with db.db_lock:
+                    # ضمان وجود التلميذ في جدول users مع مدرسته حتى لا تظهر "غير مسجل"
+                    db.cursor.execute("""
+                        INSERT OR REPLACE INTO users (user_id, full_name, school, last_active, joined_at, phone, source)
+                        VALUES (?, ?, ?, ?, ?, ?, 'web')
+                    """, (student_id, student_name, school, now, now, phone or ""))
+                    
+                    db.cursor.execute("""
+                        INSERT INTO submissions (student_id, student_name, exercise_name, photo_id, status, is_read, has_grade, notes_history)
+                        VALUES (?, ?, ?, ?, ?, 0, 0, ?)
+                    """, (student_id, student_name, exercise_name, "", "قيد الانتظار", note))
+                    db.conn.commit()
+
+                # 2. الحفظ في Turso السحابي
                 if turso_client:
-                    turso_client.execute("""
-                        INSERT INTO submissions (student_id, student_name, exercise_name, photo_id, status, is_read, has_grade)
-                        VALUES (?, ?, ?, ?, ?, 0, 0)
-                    """, [1001, student_name, exercise_name, "", "قيد الانتظار"])
+                    try:
+                        turso_client.execute("""
+                            INSERT INTO submissions (student_id, student_name, exercise_name, photo_id, status, is_read, has_grade)
+                            VALUES (?, ?, ?, ?, ?, 0, 0)
+                        """, [student_id, student_name, exercise_name, "", "قيد الانتظار"])
+                    except Exception as e_turso:
+                        print("Turso submission insert:", e_turso)
+
+                # 3. إشعار فوري للأستاذ في تيليغرام
+                import threading
+                def _notify_teacher_hw():
+                    token = os.getenv("BOT_TOKEN")
+                    if not token:
+                        return
+                    try:
+                        import urllib.request
+                        msg = (
+                            f"📥 **محاولة حل واجب جديدة من الموقع!**\n\n"
+                            f"👤 **التلميذ:** {student_name}\n"
+                            f"🏫 **المدرسة:** {school}\n"
+                            f"📱 **الهاتف:** `{phone}`\n"
+                            f"📝 **الواجب:** {exercise_name}\n"
+                            f"💬 **الملاحظة:** {note or 'لا توجد'}\n"
+                            f"⏰ **الوقت:** {now}"
+                        )
+                        url_api = f"https://api.telegram.org/bot{token}/sendMessage"
+                        data_tg = json.dumps({"chat_id": 5279737033, "text": msg, "parse_mode": "Markdown"}).encode("utf-8")
+                        req = urllib.request.Request(url_api, data=data_tg, headers={"Content-Type": "application/json"})
+                        urllib.request.urlopen(req, timeout=10)
+                    except Exception as e:
+                        print("HW telegram notify error:", e)
+
+                threading.Thread(target=_notify_teacher_hw, daemon=True).start()
 
                 return self._send_json({"success": True, "message": "تم استلام الواجب بنجاح وإرساله للأستاذ!"})
             except Exception as e:
-                print("Error saving submission to Turso:", e)
+                print("Error saving submission:", e)
                 return self._send_json({"success": False, "error": str(e)}, status=500)
 
         # ---------------- 💬 5. إرسال رسالة للأستاذ عبر الموقع ----------------
         elif path == "/api/chat/send":
-            phone = payload.get("phone", "").strip()
+            phone = normalize_phone(payload.get("phone", "").strip())
             message_text = payload.get("message", "").strip()
-            
+
             if not phone or not message_text:
-                return self._send_json({"success": False, "error": "\u064a\u0631\u062c\u0649 \u0643\u062a\u0627\u0628\u0629 \u0631\u0633\u0627\u0644\u0629."})
-            
+                return self._send_json({"success": False, "error": "يرجى كتابة رسالة."})
+
             try:
                 import db
-                student_rows = turso_client.execute("SELECT id, first_name, last_name FROM web_users WHERE phone = ?", [phone]) if turso_client else []
-                if not student_rows:
-                    return self._send_json({"success": False, "error": "\u0644\u0645 \u064a\u062a\u0645 \u0627\u0644\u0639\u062b\u0648\u0631 \u0639\u0644\u0649 \u062d\u0633\u0627\u0628\u0643."})
-                
-                student_id = student_rows[0][0]
-                student_name = f"{student_rows[0][1]} {student_rows[0][2]}".strip()
+                student_id = None
+                student_name = None
+
+                # 1. البحث في web_users
+                if turso_client:
+                    student_rows = turso_client.execute("SELECT id, first_name, last_name FROM web_users WHERE phone = ?", [phone])
+                    if student_rows:
+                        student_id = student_rows[0][0]
+                        student_name = f"{student_rows[0][1]} {student_rows[0][2]}".strip()
+
+                # 2. البحث في users (تلاميذ البوت)
+                if not student_id:
+                    with db.db_lock:
+                        db.cursor.execute("SELECT user_id, full_name FROM users WHERE phone = ?", (phone,))
+                        row = db.cursor.fetchone()
+                        if row:
+                            student_id, student_name = row[0], row[1]
+                        else:
+                            db.cursor.execute("SELECT user_id, full_name FROM wait WHERE phone = ?", (phone,))
+                            row_w = db.cursor.fetchone()
+                            if row_w:
+                                student_id, student_name = row_w[0], row_w[1]
+
+                if not student_id:
+                    student_id = abs(hash(phone)) % 1000000000
+                if not student_name:
+                    student_name = payload.get("student_name") or f"تلميذ ({phone})"
+
                 now = datetime.now().strftime("%Y-%m-%d %H:%M")
-                
+
+                # الحفظ محلياً في bot.db
                 with db.db_lock:
                     db.cursor.execute("""
                         INSERT INTO chat_messages (sender_id, sender_name, receiver_id, message_text, created_at, is_read)
                         VALUES (?, ?, 5279737033, ?, ?, 0)
                     """, (student_id, student_name, message_text, now))
                     db.conn.commit()
-                
-                # Send Telegram notification to teacher
+
+                # الحفظ سحابياً في Turso
+                if turso_client:
+                    try:
+                        turso_client.execute("""
+                            INSERT INTO chat_messages (sender_id, sender_name, receiver_id, message_text, created_at, is_read)
+                            VALUES (?, ?, 5279737033, ?, ?, 0)
+                        """, [student_id, student_name, message_text, now])
+                    except Exception as e_chat_cloud:
+                        print("Turso chat insert error:", e_chat_cloud)
+
+                # إشعار تليغرام للأستاذ
                 import threading
                 def _notify_teacher_chat():
                     token = os.getenv("BOT_TOKEN")
@@ -1022,11 +1211,11 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                     try:
                         import urllib.request
                         msg = (
-                            f"\U0001f4ac **\u0631\u0633\u0627\u0644\u0629 \u062c\u062f\u064a\u062f\u0629 \u0645\u0646 \u0627\u0644\u0645\u0648\u0642\u0639!**\n\n"
-                            f"\U0001f464 **\u0627\u0644\u062a\u0644\u0645\u064a\u0630:** {student_name}\n"
-                            f"\U0001f4f1 **\u0627\u0644\u0647\u0627\u062a\u0641:** `{phone}`\n"
-                            f"\U0001f4dd **\u0627\u0644\u0631\u0633\u0627\u0644\u0629:**\n{message_text}\n\n"
-                            f"\u23f0 **\u0627\u0644\u0648\u0642\u062a:** {now}"
+                            f"💬 **رسالة جديدة من الموقع!**\n\n"
+                            f"👤 **التلميذ:** {student_name}\n"
+                            f"📱 **الهاتف:** `{phone}`\n"
+                            f"📝 **الرسالة:**\n{message_text}\n\n"
+                            f"⏰ **الوقت:** {now}"
                         )
                         url_api = f"https://api.telegram.org/bot{token}/sendMessage"
                         data_tg = json.dumps({"chat_id": 5279737033, "text": msg, "parse_mode": "Markdown"}).encode("utf-8")
@@ -1034,13 +1223,13 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                         urllib.request.urlopen(req, timeout=10)
                     except Exception as e:
                         print("Chat telegram notify error:", e)
-                
+
                 threading.Thread(target=_notify_teacher_chat, daemon=True).start()
-                
-                return self._send_json({"success": True, "message": "\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0631\u0633\u0627\u0644\u062a\u0643 \u0644\u0644\u0623\u0633\u062a\u0627\u0630 \u0628\u0646\u062c\u0627\u062d!"})
+
+                return self._send_json({"success": True, "message": "تم إرسال رسالتك للأستاذ بنجاح!"})
             except Exception as e:
                 print("Chat send error:", e)
-                return self._send_json({"success": False, "error": "\u062d\u062f\u062b \u062e\u0637\u0623 \u0623\u062b\u0646\u0627\u0621 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u0631\u0633\u0627\u0644\u0629."})
+                return self._send_json({"success": False, "error": "حدث خطأ أثناء إرسال الرسالة."})
 
         self.send_error(404, "Endpoint not found")
 
@@ -1048,13 +1237,12 @@ class PlatformHandler(SimpleHTTPRequestHandler):
 def run():
     server_address = ("", PORT)
     httpd = ThreadingHTTPServer(server_address, PlatformHandler)
-    print(f"🚀 خادم المنصة التعليمية جاهز ويعمل على: http://localhost:{PORT}")
-    print(f"📁 مسار الموقع: {WEBSITE_DIR}")
+    print(f"🚀 خادم المنصة التعليمية يعمل الآن على: http://localhost:{PORT}")
+    print(f"📂 مسار الموقع: {WEBSITE_DIR}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nتم إيقاف الخادم.")
-
+        print("\n🛑 تم إيقاف الخادم.")
 
 if __name__ == "__main__":
     run()

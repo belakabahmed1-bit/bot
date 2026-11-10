@@ -312,8 +312,7 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                 return self._send_json({"active": int(rows[0][0])})
             return self._send_json({"active": 0})
 
-# ---------------- 1. API: قائمة الوحدات من Turso ----------------
-                # ---------------- 💬 API: جلب رسائل المحادثة مع الأستاذ ----------------
+# ---------------- 1. API: قائمة الوحدات من Turso ----------------        # ---------------- 💬 API: جلب رسائل المحادثة مع الأستاذ (خلال 24 ساعة فقط) ----------------
         elif path == "/api/chat/messages":
             phone = params.get("phone", [None])[0]
             if not phone:
@@ -321,45 +320,103 @@ class PlatformHandler(SimpleHTTPRequestHandler):
             phone = normalize_phone(phone)
             try:
                 import db
-                student_id = None
-                if turso_client:
-                    student_rows = turso_client.execute("SELECT id FROM web_users WHERE phone = ?", [phone])
-                    if student_rows:
-                        student_id = student_rows[0][0]
+                from datetime import timedelta
 
-                if not student_id:
+                # 1. تنظيف وحذف الرسائل التي تجاوزت 24 ساعة تلقائياً من السحابة والمحلي
+                cutoff_dt = datetime.now() - timedelta(hours=24)
+                cutoff = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+                cutoff_short = cutoff_dt.strftime("%Y-%m-%d %H:%M")
+
+                if turso_client:
+                    try:
+                        turso_client.execute("DELETE FROM chat_messages WHERE created_at < ? OR created_at < ?", [cutoff, cutoff_short])
+                    except Exception as e_del:
+                        pass
+                try:
+                    with db.db_lock:
+                        db.cursor.execute("DELETE FROM chat_messages WHERE created_at < ? OR created_at < ?", (cutoff, cutoff_short))
+                        db.conn.commit()
+                except Exception:
+                    pass
+
+                # 2. تجميع كل المعرفات الممكنة للتلميذ (رقم الحساب في الموقع وآيدي البوت)
+                student_ids = set()
+                if turso_client:
+                    w_res = turso_client.execute("SELECT id FROM web_users WHERE phone = ?", [phone])
+                    for wr in (w_res or []):
+                        if wr and wr[0]:
+                            student_ids.add(str(wr[0]))
+                    u_res = turso_client.execute("SELECT user_id FROM users WHERE phone = ?", [phone])
+                    for ur in (u_res or []):
+                        if ur and ur[0]:
+                            student_ids.add(str(ur[0]))
+
+                try:
                     with db.db_lock:
                         db.cursor.execute("SELECT user_id FROM users WHERE phone = ?", (phone,))
-                        u_row = db.cursor.fetchone()
-                        if u_row:
-                            student_id = u_row[0]
-                        else:
-                            db.cursor.execute("SELECT user_id FROM wait WHERE phone = ?", (phone,))
-                            w_row = db.cursor.fetchone()
-                            if w_row:
-                                student_id = w_row[0]
+                        for ur in db.cursor.fetchall():
+                            if ur and ur[0]:
+                                student_ids.add(str(ur[0]))
+                        db.cursor.execute("SELECT user_id FROM wait WHERE phone = ?", (phone,))
+                        for wr in db.cursor.fetchall():
+                            if wr and wr[0]:
+                                student_ids.add(str(wr[0]))
+                except Exception:
+                    pass
 
-                if not student_id:
-                    return self._send_json([])
+                if not student_ids:
+                    student_ids.add(str(abs(hash(phone)) % 1000000000))
 
-                with db.db_lock:
-                    db.cursor.execute("""
-                        SELECT id, sender_id, sender_name, message_text, created_at, is_read
-                        FROM chat_messages
-                        WHERE (sender_id = ? AND receiver_id = 5279737033) 
-                           OR (sender_id = 5279737033 AND receiver_id = ?)
-                        ORDER BY id ASC
-                        LIMIT 150
-                    """, (student_id, student_id))
-                    rows = db.cursor.fetchall()
+                # 3. جلب الرسائل السحابية والمحلية خلال آخر 24 ساعة
+                messages_dict = {}
+
+                # البحث في Turso السحابي
+                if turso_client:
+                    for sid in student_ids:
+                        try:
+                            cloud_rows = turso_client.execute("""
+                                SELECT id, sender_id, sender_name, message_text, created_at, is_read
+                                FROM chat_messages
+                                WHERE ((sender_id = ? AND receiver_id = 5279737033) OR (sender_id = 5279737033 AND receiver_id = ?))
+                                  AND (created_at >= ? OR created_at >= ?)
+                                ORDER BY id ASC
+                            """, [sid, sid, cutoff, cutoff_short])
+                            for r in (cloud_rows or []):
+                                dedup_key = f"{r[1]}_{r[3]}_{r[4]}"
+                                messages_dict[dedup_key] = r
+                        except Exception as e_cr:
+                            print("Turso chat select error:", e_cr)
+
+                # البحث في قاعدة البيانات المحلية كاحتياط وتكامل
+                try:
+                    with db.db_lock:
+                        for sid in student_ids:
+                            s_val = int(sid) if sid.isdigit() else sid
+                            db.cursor.execute("""
+                                SELECT id, sender_id, sender_name, message_text, created_at, is_read
+                                FROM chat_messages
+                                WHERE ((sender_id = ? AND receiver_id = 5279737033) OR (sender_id = 5279737033 AND receiver_id = ?))
+                                  AND (created_at >= ? OR created_at >= ?)
+                                ORDER BY id ASC
+                            """, (s_val, s_val, cutoff, cutoff_short))
+                            for r in db.cursor.fetchall():
+                                dedup_key = f"{r[1]}_{r[3]}_{r[4]}"
+                                if dedup_key not in messages_dict:
+                                    messages_dict[dedup_key] = list(r)
+                except Exception as e_lr:
+                    print("Local chat select error:", e_lr)
+
+                # ترتيب الرسائل زمنياً
+                raw_list = list(messages_dict.values())
+                raw_list.sort(key=lambda x: str(x[4] or ""))
 
                 messages = []
-                for r in rows:
-                    is_student = (str(r[1]) == str(student_id))
+                for r in raw_list:
+                    is_teacher = (str(r[1]) == "5279737033")
                     messages.append({
                         "id": r[0],
-                        "sender": "student" if is_student else "teacher",
-                        "sender_name": r[2] or ("أنت" if is_student else "الأستاذ بلعقاب أسامة"),
+                        "sender": "teacher" if is_teacher else "student",
+                        "sender_name": "الأستاذ بلعقاب أسامة" if is_teacher else "أنت",
                         "text": r[3],
                         "time": r[4] or "",
                         "is_read": r[5]
@@ -1142,9 +1199,7 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                 return self._send_json({"success": True, "message": "تم استلام الواجب بنجاح وإرساله للأستاذ!"})
             except Exception as e:
                 print("Error saving submission:", e)
-                return self._send_json({"success": False, "error": str(e)}, status=500)
-
-        # ---------------- 💬 5. إرسال رسالة للأستاذ عبر الموقع ----------------
+                return self._send_json({"success": False, "error": str(e)}, status=500)        # ---------------- 💬 5. إرسال رسالة للأستاذ عبر الموقع (وحفظها لـ 24 ساعة) ----------------
         elif path == "/api/chat/send":
             phone = normalize_phone(payload.get("phone", "").strip())
             message_text = payload.get("message", "").strip()
@@ -1154,55 +1209,82 @@ class PlatformHandler(SimpleHTTPRequestHandler):
 
             try:
                 import db
+                from datetime import timedelta
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                # حذف الرسائل القديمة (24 ساعة) أولاً
+                cutoff_dt = datetime.now() - timedelta(hours=24)
+                cutoff = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+                cutoff_short = cutoff_dt.strftime("%Y-%m-%d %H:%M")
+                if turso_client:
+                    try:
+                        turso_client.execute("DELETE FROM chat_messages WHERE created_at < ? OR created_at < ?", [cutoff, cutoff_short])
+                    except Exception:
+                        pass
+                try:
+                    with db.db_lock:
+                        db.cursor.execute("DELETE FROM chat_messages WHERE created_at < ? OR created_at < ?", (cutoff, cutoff_short))
+                        db.conn.commit()
+                except Exception:
+                    pass
+
                 student_id = None
                 student_name = None
+                school = "دراسة عن بعد 🌐"
 
-                # 1. البحث في web_users
+                # إذا كان التلميذ مسجلاً في البوت نفضل آيدي البوت لكي يتمكن الأستاذ من الرد عليه مباشرة في التيليغرام
                 if turso_client:
-                    student_rows = turso_client.execute("SELECT id, first_name, last_name FROM web_users WHERE phone = ?", [phone])
-                    if student_rows:
-                        student_id = student_rows[0][0]
-                        student_name = f"{student_rows[0][1]} {student_rows[0][2]}".strip()
+                    u_rows = turso_client.execute("SELECT user_id, full_name, school FROM users WHERE phone = ?", [phone])
+                    if u_rows and u_rows[0]:
+                        student_id = u_rows[0][0]
+                        student_name = u_rows[0][1]
+                        school = u_rows[0][2] or school
 
-                # 2. البحث في users (تلاميذ البوت)
                 if not student_id:
-                    with db.db_lock:
-                        db.cursor.execute("SELECT user_id, full_name FROM users WHERE phone = ?", (phone,))
-                        row = db.cursor.fetchone()
-                        if row:
-                            student_id, student_name = row[0], row[1]
-                        else:
-                            db.cursor.execute("SELECT user_id, full_name FROM wait WHERE phone = ?", (phone,))
-                            row_w = db.cursor.fetchone()
-                            if row_w:
-                                student_id, student_name = row_w[0], row_w[1]
+                    try:
+                        with db.db_lock:
+                            db.cursor.execute("SELECT user_id, full_name, school FROM users WHERE phone = ?", (phone,))
+                            r_u = db.cursor.fetchone()
+                            if r_u:
+                                student_id, student_name, school = r_u[0], r_u[1], r_u[2] or school
+                    except Exception:
+                        pass
+
+                # إذا لم يكن في البوت، نأخذ بياناته من الموقع web_users
+                if not student_id and turso_client:
+                    w_rows = turso_client.execute("SELECT id, first_name, last_name, school FROM web_users WHERE phone = ?", [phone])
+                    if w_rows and w_rows[0]:
+                        student_id = w_rows[0][0]
+                        student_name = f"{w_rows[0][1]} {w_rows[0][2]}".strip()
+                        school = w_rows[0][3] or school
 
                 if not student_id:
                     student_id = abs(hash(phone)) % 1000000000
                 if not student_name:
                     student_name = payload.get("student_name") or f"تلميذ ({phone})"
 
-                now = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-                # الحفظ محلياً في bot.db
-                with db.db_lock:
-                    db.cursor.execute("""
-                        INSERT INTO chat_messages (sender_id, sender_name, receiver_id, message_text, created_at, is_read)
-                        VALUES (?, ?, 5279737033, ?, ?, 0)
-                    """, (student_id, student_name, message_text, now))
-                    db.conn.commit()
-
-                # الحفظ سحابياً في Turso
+                # 1. الحفظ في Turso السحابي
                 if turso_client:
                     try:
                         turso_client.execute("""
                             INSERT INTO chat_messages (sender_id, sender_name, receiver_id, message_text, created_at, is_read)
                             VALUES (?, ?, 5279737033, ?, ?, 0)
                         """, [student_id, student_name, message_text, now])
-                    except Exception as e_chat_cloud:
-                        print("Turso chat insert error:", e_chat_cloud)
+                    except Exception as e_c:
+                        print("Turso chat insert error:", e_c)
 
-                # إشعار تليغرام للأستاذ
+                # 2. الحفظ في bot.db المحلي
+                try:
+                    with db.db_lock:
+                        db.cursor.execute("""
+                            INSERT INTO chat_messages (sender_id, sender_name, receiver_id, message_text, created_at, is_read)
+                            VALUES (?, ?, 5279737033, ?, ?, 0)
+                        """, (student_id, student_name, message_text, now))
+                        db.conn.commit()
+                except Exception as e_l:
+                    print("Local chat insert error:", e_l)
+
+                # 3. إرسال إشعار تليغرام فوري للأستاذ مع زر مباشر للرد على التلميذ
                 import threading
                 def _notify_teacher_chat():
                     token = os.getenv("BOT_TOKEN")
@@ -1211,14 +1293,25 @@ class PlatformHandler(SimpleHTTPRequestHandler):
                     try:
                         import urllib.request
                         msg = (
-                            f"💬 **رسالة جديدة من الموقع!**\n\n"
-                            f"👤 **التلميذ:** {student_name}\n"
-                            f"📱 **الهاتف:** `{phone}`\n"
-                            f"📝 **الرسالة:**\n{message_text}\n\n"
-                            f"⏰ **الوقت:** {now}"
+                            f"💬 **استفسار جديد من التلميذ:**\n"
+                            f"👤 *{student_name}* ({school})\n"
+                            f"📱 الهاتف: `{phone}`\n"
+                            f"🆔 الآيدي: `{student_id}`\n\n"
+                            f"📝 *الرسالة:*\n{message_text}\n\n"
+                            f"🕒 {now}"
                         )
+                        reply_markup = {
+                            "inline_keyboard": [
+                                [{"text": f"✉️ فتح المحادثة والرد على {student_name}", "callback_data": f"open_chat_{student_id}"}]
+                            ]
+                        }
                         url_api = f"https://api.telegram.org/bot{token}/sendMessage"
-                        data_tg = json.dumps({"chat_id": 5279737033, "text": msg, "parse_mode": "Markdown"}).encode("utf-8")
+                        data_tg = json.dumps({
+                            "chat_id": 5279737033,
+                            "text": msg,
+                            "reply_markup": reply_markup,
+                            "parse_mode": "Markdown"
+                        }).encode("utf-8")
                         req = urllib.request.Request(url_api, data=data_tg, headers={"Content-Type": "application/json"})
                         urllib.request.urlopen(req, timeout=10)
                     except Exception as e:

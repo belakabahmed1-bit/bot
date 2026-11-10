@@ -505,7 +505,8 @@ def cleanup_old_chat_messages():
     with db_lock:
         try:
             cutoff = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-            cursor.execute("DELETE FROM chat_messages WHERE created_at < ?", (cutoff,))
+            cutoff_short = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
+            cursor.execute("DELETE FROM chat_messages WHERE created_at < ? OR created_at < ?", (cutoff, cutoff_short))
             conn.commit()
         except Exception as e:
             print("Chat cleanup error:", e)

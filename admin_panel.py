@@ -160,8 +160,16 @@ def get_user_full_name(user_id):
     with db_lock:
         cursor.execute("SELECT full_name FROM users WHERE user_id = ?", (user_id,))
         res = cursor.fetchone()
-        if res:
+        if res and res[0]:
             return res[0]
+        cursor.execute("SELECT first_name, last_name FROM web_users WHERE id = ?", (user_id,))
+        res_w = cursor.fetchone()
+        if res_w and (res_w[0] or res_w[1]):
+            return f"{res_w[0] or ''} {res_w[1] or ''}".strip()
+        cursor.execute("SELECT sender_name FROM chat_messages WHERE sender_id = ? AND sender_id != 5279737033 ORDER BY id DESC LIMIT 1", (user_id,))
+        res_c = cursor.fetchone()
+        if res_c and res_c[0]:
+            return res_c[0]
         cursor.execute("SELECT full_name FROM deleted_users WHERE user_id = ?", (user_id,))
         res = cursor.fetchone()
         return res[0] if res else "تلميذ"
@@ -1755,25 +1763,40 @@ def process_send_chat_reply(message, bot, student_id, student_name):
     reply_text = (message.text or "").strip()
     now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # 1. حفظ رد الأستاذ دائماً في قاعدة البيانات ليظهر للتلميذ في الموقع والبوت فوراً
     try:
-        bot.send_message(
-            student_id,
-            f"👑 **رسالة جديدة من الأستاذ بلعقاب أسامة:**\n\n{reply_text}\n\n🕒 {now_time}",
-            parse_mode="Markdown"
-        )
         with db_lock:
             cursor.execute(
                 "INSERT INTO chat_messages (sender_id, sender_name, receiver_id, message_text, created_at, is_read) VALUES (?, ?, ?, ?, ?, 1)",
                 (ADMIN_ID, "الأستاذ أسامة", student_id, reply_text, now_time)
             )
             conn.commit()
-        bot.send_message(chat_id, f"✅ تم إرسال ردك بنجاح إلى التلميذ ({student_name})!", reply_markup=admin_reply_menu())
-        send_admin_panel(bot, chat_id)
-    except Exception as e:
-        bot.send_message(chat_id, f"❌ تعذر إرسال الرد:\n`{e}`", reply_markup=admin_reply_menu(), parse_mode="Markdown")
+    except Exception as e_db:
+        print("Save chat reply to DB error:", e_db)
+
+    # 2. محاولة إرسال رسالة تليغرام للتلميذ (إذا كان مسجلاً في البوت ولديه محادثة مفتوحة)
+    sent_via_tg = False
+    try:
+        bot.send_message(
+            student_id,
+            f"👑 **رسالة جديدة من الأستاذ بلعقاب أسامة:**\n\n{reply_text}\n\n🕒 {now_time}",
+            parse_mode="Markdown"
+        )
+        sent_via_tg = True
+    except Exception:
+        # التلميذ مسجل من الموقع فقط وليس لديه شات تيليغرام مفتوح مع البوت
+        pass
+
+    channel_info = "عبر البوت والموقع" if sent_via_tg else "عبر الموقع"
+    bot.send_message(
+        chat_id,
+        f"✅ **تم إرسال وحفظ ردك بنجاح ({channel_info}) إلى التلميذ ({student_name})!**\nسيظهر الرد مباشرة في حسابه.",
+        reply_markup=admin_reply_menu(),
+        parse_mode="Markdown"
+    )
+    send_admin_panel(bot, chat_id)
 
 
-# 4. حفظ العلامة والملاحظات الاحترافية
 def process_save_grade(message, bot, student_id, ex_id):
     chat_id = message.chat.id
     if message.text == "القائمة الرئيسية":

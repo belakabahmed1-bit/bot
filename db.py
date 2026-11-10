@@ -633,23 +633,71 @@ def extract_youtube_id(url):
 
 def get_active_videos(unit_id=None):
     with db_lock:
-        if unit_id and unit_id != "all":
+        if unit_id is not None and unit_id != "all":
             cursor.execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos WHERE is_active = 1 AND unit_id = ? ORDER BY id DESC", (unit_id,))
         else:
             cursor.execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos WHERE is_active = 1 ORDER BY id DESC")
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        if rows:
+            return rows
+
+    try:
+        from web_server import turso_client
+        if turso_client:
+            if unit_id is not None and unit_id != "all":
+                t_rows = turso_client._remote_execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos WHERE is_active = 1 AND unit_id = ? ORDER BY id DESC", [unit_id])
+            else:
+                t_rows = turso_client._remote_execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos WHERE is_active = 1 ORDER BY id DESC")
+            if t_rows:
+                return t_rows
+    except Exception as e:
+        print("get_active_videos turso sync error:", e)
+    return []
 
 
-def get_all_videos():
+def get_all_videos(unit_id=None):
     with db_lock:
-        cursor.execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos ORDER BY id DESC")
-        return cursor.fetchall()
+        if unit_id is not None and unit_id != "all":
+            cursor.execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos WHERE unit_id = ? ORDER BY id DESC", (unit_id,))
+        else:
+            cursor.execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos ORDER BY id DESC")
+        rows = cursor.fetchall()
+        if rows:
+            return rows
+
+    # Fallback / sync from Turso if local sqlite has no records
+    try:
+        from web_server import turso_client
+        if turso_client:
+            if unit_id is not None and unit_id != "all":
+                t_rows = turso_client._remote_execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos WHERE unit_id = ? ORDER BY id DESC", [unit_id])
+            else:
+                t_rows = turso_client._remote_execute("SELECT id, title, youtube_id, unit_id, unit_name, is_active, created_at FROM videos ORDER BY id DESC")
+            if t_rows:
+                with db_lock:
+                    for r in t_rows:
+                        cursor.execute("""
+                            INSERT OR IGNORE INTO videos (id, title, youtube_id, unit_id, unit_name, is_active, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (r[0], r[1], r[2], r[3], r[4], r[5], r[6]))
+                    conn.commit()
+                return t_rows
+    except Exception as e:
+        print("get_all_videos turso sync error:", e)
+    return []
 
 
 def add_video(title, youtube_url, unit_id=0, unit_name="عام"):
     yt_id = extract_youtube_id(youtube_url)
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
+    # 1. التحقق من وجود الفيديو في قاعدة البيانات لمنع التكرار نهائياً
     with db_lock:
+        cursor.execute("SELECT id FROM videos WHERE youtube_id = ? AND unit_id = ?", (yt_id, unit_id))
+        row = cursor.fetchone()
+        if row:
+            return row[0], False
+
         cursor.execute(
             "INSERT INTO videos (title, youtube_id, unit_id, unit_name, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
             (title, yt_id, unit_id, unit_name, now)
@@ -657,16 +705,22 @@ def add_video(title, youtube_url, unit_id=0, unit_name="عام"):
         conn.commit()
         vid_id = cursor.lastrowid
 
-    try:
-        from web_server import turso_client
-        if turso_client:
-            turso_client.execute(
-                "INSERT INTO videos (title, youtube_id, unit_id, unit_name, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
-                [title, yt_id, unit_id, unit_name, now]
-            )
-    except Exception as e:
-        print("Turso sync add video error:", e)
-    return vid_id
+    # 2. المزامنة مع Turso فقط إذا لم تكن قاعدة البيانات الحالية متصلة بـ Turso مباشرة
+    is_direct_turso = bool(libsql is not None and URL and TOKEN)
+    if not is_direct_turso:
+        try:
+            from web_server import turso_client
+            if turso_client:
+                existing = turso_client._remote_execute("SELECT id FROM videos WHERE youtube_id = ? AND unit_id = ?", [yt_id, unit_id])
+                if not existing:
+                    turso_client._remote_execute(
+                        "INSERT INTO videos (title, youtube_id, unit_id, unit_name, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+                        [title, yt_id, unit_id, unit_name, now]
+                    )
+        except Exception as e:
+            print("Turso sync add video error:", e)
+
+    return vid_id, True
 
 
 def toggle_video_active(video_id):
@@ -677,12 +731,14 @@ def toggle_video_active(video_id):
         row = cursor.fetchone()
         new_val = row[0] if row else 1
 
-    try:
-        from web_server import turso_client
-        if turso_client:
-            turso_client.execute("UPDATE videos SET is_active = ? WHERE id = ?", [new_val, video_id])
-    except Exception as e:
-        print("Turso sync toggle video error:", e)
+    is_direct_turso = bool(libsql is not None and URL and TOKEN)
+    if not is_direct_turso:
+        try:
+            from web_server import turso_client
+            if turso_client:
+                turso_client._remote_execute("UPDATE videos SET is_active = ? WHERE id = ?", [new_val, video_id])
+        except Exception as e:
+            print("Turso sync toggle video error:", e)
     return new_val
 
 
@@ -691,9 +747,11 @@ def delete_video(video_id):
         cursor.execute("DELETE FROM videos WHERE id = ?", (video_id,))
         conn.commit()
 
-    try:
-        from web_server import turso_client
-        if turso_client:
-            turso_client.execute("DELETE FROM videos WHERE id = ?", [video_id])
-    except Exception as e:
-        print("Turso sync delete video error:", e)
+    is_direct_turso = bool(libsql is not None and URL and TOKEN)
+    if not is_direct_turso:
+        try:
+            from web_server import turso_client
+            if turso_client:
+                turso_client._remote_execute("DELETE FROM videos WHERE id = ?", [video_id])
+        except Exception as e:
+            print("Turso sync delete video error:", e)

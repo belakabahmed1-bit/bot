@@ -49,6 +49,18 @@ admin_state = {}
 admin_upload_cache = {}
 admin_video_state = {}
 
+VIDEO_UNITS = [
+    (1, "الدوال العددية 📉"),
+    (2, "الدلة الأسية 📈"),
+    (3, "الدلة اللوغارتمية 📊"),
+    (4, "المتتاليات 🔢"),
+    (5, "الاحتمالات 🎲"),
+    (6, "القسمة في Z ➗"),
+    (7, "الأعداد المركبة 🧮"),
+    (0, "شروحات عامة 🎬")
+]
+VIDEO_UNITS_DICT = dict(VIDEO_UNITS)
+
 
 # ===================== دوال الاستعلام والبيانات =====================
 def get_bot_phones():
@@ -430,13 +442,38 @@ def setup_admin_panel_handlers(bot):
             )
         elif step == "url":
             st["url"] = text
-            st["step"] = "unit"
-            bot.send_message(
-                chat_id,
-                "📚 **اختر الوحدة التابع لها هذا الفيديو:**",
-                reply_markup=build_video_units_picker(),
-                parse_mode="Markdown"
-            )
+            if "unit_id" in st:
+                u_id = st["unit_id"]
+                u_name = VIDEO_UNITS_DICT.get(u_id, "شروحات عامة 🎬")
+                admin_video_state.pop(chat_id, None)
+                vid_id, is_new = db.add_video(st["title"], text, u_id, u_name)
+                if is_new:
+                    bot.send_message(
+                        chat_id,
+                        f"🎉 **تمت إضافة الفيديو بنجاح!**\n\n"
+                        f"🎬 **العنوان:** {st['title']}\n"
+                        f"📚 **الوحدة:** {u_name}\n"
+                        f"🟢 **الحالة:** مفعّل ومتاح للجميع في الموقع وبوت التليجرام 🚀",
+                        reply_markup=admin_reply_menu(),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    bot.send_message(
+                        chat_id,
+                        f"⚠️ **هذا الفيديو موجود مسبقاً في وحدة ({u_name})!**\nلم تتم إضافته مجدداً لمنع التكرار.",
+                        reply_markup=admin_reply_menu(),
+                        parse_mode="Markdown"
+                    )
+                text_u, markup_u = build_admin_unit_videos_menu(u_id)
+                bot.send_message(chat_id, text_u, reply_markup=markup_u, parse_mode="Markdown")
+            else:
+                st["step"] = "unit"
+                bot.send_message(
+                    chat_id,
+                    "📚 **اختر الوحدة التابع لها هذا الفيديو:**",
+                    reply_markup=build_video_units_picker(),
+                    parse_mode="Markdown"
+                )
 
     @bot.message_handler(func=lambda message: message.text == "🔙 العودة للوحة الأدمن" and message.from_user.id == ADMIN_ID)
     def exit_student_mode(message):
@@ -1042,24 +1079,46 @@ def handle_admin_callback(bot, call):
             msg = bot.send_message(chat_id, f"💬 **أرسل ملاحظتك أو توجيهك للتلميذ حول الواجب:**", reply_markup=admin_reply_menu())
             bot.register_next_step_handler(msg, process_save_note, bot, s_id, ex_id)
 
-        # ----------------- 8. تسيير مواضيع البكالوريا -----------------
+        # ----------------- 8. تسيير الفيديوهات والشروحات مقسمة بالوحدات -----------------
         elif data == "manage_videos_menu":
             text, markup = build_admin_videos_menu()
             bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
 
+        elif data.startswith("admin_vid_u_"):
+            raw_uid = data.replace("admin_vid_u_", "")
+            u_id = "all" if raw_uid == "all" else int(raw_uid)
+            text, markup = build_admin_unit_videos_menu(u_id)
+            bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif data.startswith("add_vid_to_u_"):
+            u_id = int(data.replace("add_vid_to_u_", ""))
+            u_name = VIDEO_UNITS_DICT.get(u_id, "الوحدة")
+            admin_video_state[chat_id] = {"step": "title", "unit_id": u_id}
+            bot.send_message(
+                chat_id,
+                f"🎥 **إضافة فيديو جديد لوحدة ({u_name}):**\n\n"
+                f"✏️ أرسل الآن **عنوان الفيديو** (مثال: ملخص شامل لحالات النهايات):",
+                reply_markup=ReplyKeyboardRemove(),
+                parse_mode="Markdown"
+            )
+
         elif data.startswith("toggle_vid_"):
-            vid_id = int(data.split("_")[-1])
+            parts = data.split("_")
+            vid_id = int(parts[2])
+            current_unit = parts[3] if len(parts) > 3 else "all"
             new_val = db.toggle_video_active(vid_id)
             ans = "🟢 تم تفعيل الفيديو للجميع في الموقع والبوت" if new_val == 1 else "🔴 تم إغلاق الفيديو عن الجميع"
             bot.answer_callback_query(call.id, ans)
-            text, markup = build_admin_videos_menu()
+            text, markup = build_admin_unit_videos_menu(current_unit)
             bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
 
         elif data.startswith("del_vid_"):
-            vid_id = int(data.split("_")[-1])
+            parts = data.split("_")
+            vid_id = int(parts[2])
+            current_unit = parts[3] if len(parts) > 3 else "all"
             db.delete_video(vid_id)
             bot.answer_callback_query(call.id, "تم حذف الفيديو بنجاح 🗑️")
-            text, markup = build_admin_videos_menu()
+            text, markup = build_admin_unit_videos_menu(current_unit)
             bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="Markdown")
 
         elif data == "add_new_video_start":
@@ -1078,23 +1137,26 @@ def handle_admin_callback(bot, call):
             if not st or "title" not in st:
                 bot.answer_callback_query(call.id, "انتهت الجلسة، ابدأ من جديد.")
             else:
-                unit_names = {
-                    1: "الدوال العددية 📉", 2: "الدلة الأسية 📈", 3: "الدلة اللوغارتمية 📊",
-                    4: "المتتاليات 🔢", 5: "الاحتمالات 🎲", 6: "القسمة في Z ➗",
-                    7: "الأعداد المركبة 🧮", 0: "شرح عام 🎬"
-                }
-                u_name = unit_names.get(u_id, "شرح عام 🎬")
-                db.add_video(st["title"], st.get("url", ""), u_id, u_name)
-                bot.send_message(
-                    chat_id,
-                    f"🎉 **تمت إضافة الفيديو بنجاح!**\n\n"
-                    f"🎬 **العنوان:** {st['title']}\n"
-                    f"📚 **الوحدة:** {u_name}\n"
-                    f"🟢 **الحالة:** مفعّل ومتاح للجميع في الموقع وبوت التليجرام 🚀",
-                    reply_markup=admin_reply_menu(),
-                    parse_mode="Markdown"
-                )
-                text, markup = build_admin_videos_menu()
+                u_name = VIDEO_UNITS_DICT.get(u_id, "شروحات عامة 🎬")
+                vid_id, is_new = db.add_video(st["title"], st.get("url", ""), u_id, u_name)
+                if is_new:
+                    bot.send_message(
+                        chat_id,
+                        f"🎉 **تمت إضافة الفيديو بنجاح!**\n\n"
+                        f"🎬 **العنوان:** {st['title']}\n"
+                        f"📚 **الوحدة:** {u_name}\n"
+                        f"🟢 **الحالة:** مفعّل ومتاح للجميع في الموقع وبوت التليجرام 🚀",
+                        reply_markup=admin_reply_menu(),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    bot.send_message(
+                        chat_id,
+                        f"⚠️ **هذا الفيديو موجود مسبقاً في وحدة ({u_name})!**\nلم تتم إضافته مجدداً لمنع التكرار.",
+                        reply_markup=admin_reply_menu(),
+                        parse_mode="Markdown"
+                    )
+                text, markup = build_admin_unit_videos_menu(u_id)
                 bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
 
         elif data == "manage_bac_menu":
@@ -2110,51 +2172,100 @@ def notify_all_students(bot, text):
 def build_admin_videos_menu():
     videos = db.get_all_videos()
     total = len(videos)
-    active_count = sum(1 for v in videos if v[5] == 1)
+    active_count = sum(1 for v in videos if int(v[5]) == 1)
 
     text = (
-        f"🎥 **إدارة الفيديوهات والشروحات الرسمية:**\n\n"
-        f"📊 **إجمالي الفيديوهات:** {total} | 🟢 **المفعلة:** {active_count} | 🔴 **المغلقة:** {total - active_count}\n\n"
-        f"💡 يمكنك إضافة فيديو جديد، تفعيله أو إغلاقه بضغطة واحدة، أو حذفه من المنصة والبوت:"
+        f"🎥 **إدارة الفيديوهات والشروحات الرسمية مقسمة بالوحدات:**\n\n"
+        f"📊 **الإحصائيات العامة:**\n"
+        f"• إجمالي الفيديوهات: `{total}` فيديو\n"
+        f"• المفعلة للجميع: `{active_count} 🟢`\n"
+        f"• المغلقة: `{total - active_count} 🔴`\n\n"
+        f"📂 **اختر الوحدة الدراسية لعرض وإدارة فيديوهاتها مباشرة:** 👇"
     )
 
-    markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        InlineKeyboardButton("➕ إضافة فيديو جديد", callback_data="add_new_video_start")
-    )
-
+    markup = InlineKeyboardMarkup(row_width=2)
+    
+    # حساب عدد الفيديوهات لكل وحدة
+    unit_counts = {}
     for v in videos:
-        vid_id, title, yt_id, unit_id, unit_name, is_act, created = v
-        status_icon = "🟢" if is_act == 1 else "🔴"
-        toggle_text = "🔒 إغلاق" if is_act == 1 else "🔓 تفعيل"
-        yt_link = f"https://youtu.be/{yt_id}" if yt_id else "https://youtube.com"
+        u_id = int(v[3]) if str(v[3]).isdigit() else 0
+        unit_counts[u_id] = unit_counts.get(u_id, 0) + 1
 
-        title_display = f"{status_icon} {title[:32]} ({unit_name})"
-        markup.add(InlineKeyboardButton(title_display, url=yt_link))
-        markup.add(
-            InlineKeyboardButton(f"🔄 {toggle_text}", callback_data=f"toggle_vid_{vid_id}"),
-            InlineKeyboardButton("🗑️ حذف", callback_data=f"del_vid_{vid_id}")
-        )
+    unit_buttons = []
+    for uid, uname in VIDEO_UNITS:
+        cnt = unit_counts.get(uid, 0)
+        badge = f" ({cnt})" if cnt > 0 else " (0)"
+        unit_buttons.append(InlineKeyboardButton(f"{uname}{badge}", callback_data=f"admin_vid_u_{uid}"))
+    
+    for i in range(0, len(unit_buttons), 2):
+        if i + 1 < len(unit_buttons):
+            markup.add(unit_buttons[i], unit_buttons[i+1])
+        else:
+            markup.add(unit_buttons[i])
 
+    markup.add(
+        InlineKeyboardButton("➕ إضافة فيديو جديد", callback_data="add_new_video_start"),
+        InlineKeyboardButton(f"📋 كل الفيديوهات ({total})", callback_data="admin_vid_u_all")
+    )
     markup.add(InlineKeyboardButton("🔙 العودة للوحة الأدمن", callback_data="admin_home"))
+    return text, markup
+
+
+def build_admin_unit_videos_menu(unit_id):
+    if unit_id == "all" or unit_id is None:
+        vids = db.get_all_videos()
+        unit_name = "جميع الفيديوهات في كل الوحدات 📚"
+    else:
+        unit_id = int(unit_id)
+        vids = db.get_all_videos(unit_id)
+        unit_name = VIDEO_UNITS_DICT.get(unit_id, "شروحات عامة 🎬")
+
+    total = len(vids)
+    active_count = sum(1 for v in vids if int(v[5]) == 1)
+
+    text = (
+        f"🎬 **إدارة فيديوهات: {unit_name}**\n\n"
+        f"📊 **عدد الفيديوهات:** `{total}` (🟢 {active_count} مفعل | 🔴 {total - active_count} مغلق)\n\n"
+        f"💡 يمكنك مشاهدة الفيديو، تفعيله أو إغلاقه بضغطة واحدة، أو حذفه:"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+
+    if unit_id != "all":
+        markup.add(InlineKeyboardButton("➕ إضافة فيديو لهذه الوحدة", callback_data=f"add_vid_to_u_{unit_id}"))
+    else:
+        markup.add(InlineKeyboardButton("➕ إضافة فيديو جديد", callback_data="add_new_video_start"))
+
+    if not vids:
+        text += "\n\n⚠️ *لا توجد فيديوهات مضافة في هذه الوحدة حتى الآن.*"
+    else:
+        for v in vids:
+            vid_id, title, yt_id, u_id, u_name, is_act, created = v
+            status_icon = "🟢" if int(is_act) == 1 else "🔴"
+            toggle_text = "🔒 إغلاق" if int(is_act) == 1 else "🔓 تفعيل"
+            yt_link = f"https://youtu.be/{yt_id}" if yt_id else "https://youtube.com"
+
+            title_display = f"{status_icon} {title[:30]}"
+            markup.add(InlineKeyboardButton(title_display, url=yt_link))
+            markup.add(
+                InlineKeyboardButton(f"🔄 {toggle_text}", callback_data=f"toggle_vid_{vid_id}_{unit_id}"),
+                InlineKeyboardButton("🗑️ حذف", callback_data=f"del_vid_{vid_id}_{unit_id}")
+            )
+
+    markup.add(InlineKeyboardButton("🔙 العودة لقائمة الوحدات", callback_data="manage_videos_menu"))
+    markup.add(InlineKeyboardButton("👑 العودة للوحة الأدمن", callback_data="admin_home"))
     return text, markup
 
 
 def build_video_units_picker():
     markup = InlineKeyboardMarkup(row_width=2)
-    units = [
-        (1, "الدوال العددية 📉"),
-        (2, "الدلة الأسية 📈"),
-        (3, "الدلة اللوغارتمية 📊"),
-        (4, "المتتاليات 🔢"),
-        (5, "الاحتمالات 🎲"),
-        (6, "القسمة في Z ➗"),
-        (7, "الأعداد المركبة 🧮"),
-        (0, "شرح عام 🎬")
-    ]
-    for uid, uname in units:
-        markup.add(InlineKeyboardButton(uname, callback_data=f"vid_u_{uid}"))
-    markup.add(InlineKeyboardButton("🔙 إلغاء", callback_data="manage_videos_menu"))
+    buttons = [InlineKeyboardButton(uname, callback_data=f"vid_u_{uid}") for uid, uname in VIDEO_UNITS]
+    for i in range(0, len(buttons), 2):
+        if i + 1 < len(buttons):
+            markup.add(buttons[i], buttons[i+1])
+        else:
+            markup.add(buttons[i])
+    markup.add(InlineKeyboardButton("🔙 إلغاء والعودة", callback_data="manage_videos_menu"))
     return markup
 
 def find_student_code_info(query):
